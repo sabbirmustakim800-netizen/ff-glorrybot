@@ -9,3 +9,6 @@ venv/
 .vercel/
 node_modules/
 *.log
+# local secrets (never commit)
+gh-token.txt
+.github-token
