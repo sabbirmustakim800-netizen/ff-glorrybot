@@ -1,0 +1,1 @@
+"""FF Glory Bot — payment-verifying Telegram bot/web service."""
