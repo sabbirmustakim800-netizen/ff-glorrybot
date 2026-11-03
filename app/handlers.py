@@ -1305,3 +1305,437 @@ async def handle_media(ctx: Ctx, media: dict) -> None:
         "I only accept text here. Send /start to open the menu.",
         kb.main_menu(ctx.is_admin),
     )
+
+
+# ------------------------------------------------------------- deposits: handlers
+
+
+async def cmd_bkash(ctx: Ctx) -> None:
+    bk = bkash_settings(ctx)
+    if not (bk.bkash_base_url and bk.bkash_api_key):
+        await send_message(
+            ctx.chat_id,
+            "bKash verification is not configured yet "
+            "(set BKASH_API_BASE_URL and BKASH_API_KEY).",
+        )
+        return
+    if len(ctx.args) < 2:
+        await send_message(
+            ctx.chat_id,
+            "Usage: /bkash <TrxID> <sender_number> [amount]\n"
+            "Example: /bkash BFD90JRLST 01712345678 500",
+        )
+        return
+    trx = re.sub(r"[^A-Za-z0-9]", "", ctx.args[0]).upper()
+    if not TRX_RE.match(trx):
+        await send_message(ctx.chat_id, "Invalid TrxID. Example: /bkash BFD90JRLST 01712345678 500")
+        return
+    sender = bkash_api.normalize_bkash_number(ctx.args[1])
+    if not sender:
+        await send_message(
+            ctx.chat_id,
+            "Invalid sender number. Use 01XXXXXXXXX (or +8801XXXXXXXXX).",
+        )
+        return
+    declared: float | None = None
+    if len(ctx.args) >= 3:
+        declared = _parse_amount(ctx.args[2])
+        if declared is None:
+            await send_message(ctx.chat_id, "Invalid amount. Example: /bkash BFD90JRLST 01712345678 500")
+            return
+
+    action, pid = await db.claim_payment(
+        "bkash", trx, ctx.user_id, {"sender": sender, "amount": declared}
+    )
+    if action == "busy":
+        await send_message(
+            ctx.chat_id,
+            "This TrxID is already being verified or has been used before. "
+            "Each TrxID can only be used once.",
+        )
+        return
+
+    await send_message(
+        ctx.chat_id,
+        "Verifying your bKash payment… this can take up to ~30 seconds.",
+    )
+    check = await bkash_api.verify_bkash_trxid(
+        bk, ctx.client, trx_id=trx, sender=sender, amount=declared
+    )
+    await _resolve_bkash(ctx, pid, trx, declared, check)
+
+
+async def _resolve_bkash(
+    ctx: Ctx, pid: str, trx: str, declared: float | None, check: bkash_api.BkashCheck
+) -> None:
+    details: dict = {
+        "state": check.state,
+        "message": check.message,
+        "http_status": check.http_status,
+        "attempts": check.attempts,
+        "provider_sender": check.sender,
+        "provider_amount": check.amount,
+        "provider_time": check.timestamp.isoformat() if check.timestamp else None,
+    }
+    if isinstance(check.raw, (dict, list)):
+        details["raw"] = check.raw
+
+    if check.state == "verified":
+        if check.sender_state == "mismatch":
+            await db.finish_payment(pid, "rejected", reason="sender_mismatch", details=details)
+            await send_message(
+                ctx.chat_id,
+                "The sender number does not match this TrxID. "
+                "The payment must be sent from the number you submitted.",
+            )
+            return
+        amount = check.amount
+        if amount is None or amount <= 0:
+            await db.finish_payment(
+                pid, "needs_review", reason="amount_not_returned", details=details
+            )
+            await send_message(
+                ctx.chat_id,
+                f"TrxID {trx} verified, but the provider did not return the amount. "
+                "An admin will credit your account manually.",
+            )
+            return
+        if not await db.credit_payment(pid, ctx.user_id, amount):
+            await send_message(ctx.chat_id, "This payment has already been processed.")
+            return
+        balance = await db.get_balance(ctx.user_id)
+        note = ""
+        if declared is not None and abs(declared - amount) > 0.01:
+            note += f"\nYou declared ৳{_money(declared)}; verified amount is ৳{_money(amount)}."
+        if check.sender_state != "match":
+            note += "\nNote: the provider did not return a sender number to cross-check."
+        await send_message(
+            ctx.chat_id,
+            f"bKash payment verified.\n"
+            f"TrxID: {trx}\n"
+            f"Sender: {check.sender or 'n/a'}\n"
+            f"Amount: ৳{_money(amount)}\n\n"
+            f"New balance: ৳{_money(balance)}{note}",
+            kb.main_menu(ctx.is_admin),
+        )
+        return
+
+    await db.finish_payment(pid, "rejected", reason=check.state, details=details)
+    if check.state == "pending":
+        text = "The transaction is still pending at bKash. Wait a minute and run the command again."
+    elif check.state == "not_found":
+        text = (
+            "We could not find that TrxID yet. Check the TrxID and try again in a "
+            "minute (bKash SMS forwarding can be slow)."
+        )
+    elif check.state == "failed":
+        text = f"Verification failed: {check.message or 'transaction is not valid.'}"
+    elif check.state == "error":
+        text = f"Verification service error: {check.message}\nContact support if this keeps happening."
+    else:
+        text = "The verification service is unreachable right now. Please try again in a minute."
+    await send_message(ctx.chat_id, text)
+
+
+async def cmd_binance(ctx: Ctx) -> None:
+    bn = binance_settings(ctx)
+    if not (bn.binance_api_key and bn.binance_api_secret):
+        await send_message(
+            ctx.chat_id,
+            "Crypto verification is not configured yet "
+            "(set BINANCE_API_KEY and BINANCE_API_SECRET).",
+        )
+        return
+    if len(ctx.args) < 2:
+        await send_message(
+            ctx.chat_id,
+            "Usage: /binance <COIN> <txId> [amount]\n"
+            "Example: /binance USDT 98A3EA560C6B3336D348B6C83F0F95ECE4F1F5919E94BD006E5BF3BF264FACFC 10",
+        )
+        return
+    coin = ctx.args[0].strip().upper()
+    if not COIN_RE.match(coin):
+        await send_message(ctx.chat_id, "Invalid coin. Example: /binance USDT <txId> 10")
+        return
+    txid = ctx.args[1].strip()
+    if not TXID_RE.match(txid):
+        await send_message(ctx.chat_id, "Invalid transaction hash. Example: /binance USDT <txId> 10")
+        return
+    declared: float | None = None
+    if len(ctx.args) >= 3:
+        declared = _parse_amount(ctx.args[2])
+        if declared is None:
+            await send_message(ctx.chat_id, "Invalid amount. Example: /binance USDT <txId> 10")
+            return
+
+    action, pid = await db.claim_payment(
+        "binance", txid.upper(), ctx.user_id, {"coin": coin, "amount": declared}
+    )
+    if action == "busy":
+        await send_message(
+            ctx.chat_id,
+            "This transaction is already being verified or has been credited before.",
+        )
+        return
+
+    await send_message(ctx.chat_id, "Checking Binance for your deposit…")
+    try:
+        records = await binance_api.fetch_deposits(
+            ctx.client, bn, coin=coin, tx_id=txid
+        )
+    except binance_api.BinanceAPIError as exc:
+        await db.finish_payment(
+            pid,
+            "rejected",
+            reason="binance_error",
+            details={"error": str(exc), "retryable": exc.retryable},
+        )
+        await send_message(ctx.chat_id, f"Binance check failed: {exc}\nPlease try again shortly.")
+        return
+
+    state, record = binance_api.classify(records, txid)
+    details: dict = {"state": state, "coin": coin, "record": record}
+
+    if state == "credited":
+        amount = binance_api.deposit_amount(record)
+        rate = (ctx.api["rates"] or {}).get(coin)
+        if amount is None or amount <= 0:
+            await db.finish_payment(pid, "needs_review", reason="amount_missing", details=details)
+            await send_message(
+                ctx.chat_id,
+                "Deposit found, but the amount could not be read. "
+                "An admin will credit your account manually.",
+            )
+            return
+        if rate is None:
+            await db.finish_payment(pid, "needs_review", reason="no_rate", details=details)
+            await send_message(
+                ctx.chat_id,
+                f"Binance deposit confirmed: {amount} {coin}\n"
+                f"No BDT rate is configured for {coin}, so an admin will credit "
+                "your account manually.",
+            )
+            return
+        credit = round(amount * rate, 2)
+        if not await db.credit_payment(pid, ctx.user_id, credit):
+            await send_message(ctx.chat_id, "This payment has already been processed.")
+            return
+        balance = await db.get_balance(ctx.user_id)
+        note = ""
+        if declared is not None and abs(declared - amount) > 1e-8:
+            note += f"\nYou expected {declared} {coin}; the deposit is {amount} {coin}."
+        await send_message(
+            ctx.chat_id,
+            f"Binance deposit confirmed.\n"
+            f"{amount} {coin} × {rate:g} = ৳{_money(credit)} credited.\n\n"
+            f"New balance: ৳{_money(balance)}{note}",
+            kb.main_menu(ctx.is_admin),
+        )
+        return
+
+    await db.finish_payment(pid, "rejected", reason=state, details=details)
+    if state == "pending":
+        status = (record or {}).get("status")
+        text = (
+            f"The deposit is still confirming on Binance (status: {status}). "
+            "Run /binance again in a few minutes."
+        )
+    elif state == "rejected":
+        text = "Binance reports this deposit as rejected or invalid, so it cannot be credited."
+    else:
+        text = (
+            f"No deposit with that transaction ID was found for {coin} yet. "
+            "Deposits can take a few minutes — run /binance again shortly, and make "
+            "sure the funds were sent to your Binance deposit address."
+        )
+    await send_message(ctx.chat_id, text)
+
+
+# ----------------------------------------------------------------- ff commands
+
+
+async def _ff_or_warn(ctx: Ctx) -> GloryAPI | None:
+    await ensure_user_key(ctx)
+    api = glory_client(ctx, platform=True)
+    if not api.configured:
+        await send_message(
+            ctx.chat_id,
+            "FFGlory API is not configured yet "
+            "(set FFGLORY_API_KEY and FFGLORY_MASTER_KEY in the admin panel).",
+        )
+        return None
+    return api
+
+
+async def cmd_ffbalance(ctx: Ctx) -> None:
+    api = await _ff_or_warn(ctx)
+    if api is None:
+        return
+    try:
+        bal = await api.balance()
+    except GloryAPIError as exc:
+        await send_message(
+            ctx.chat_id,
+            f"FFGlory check failed ({exc.status}): {exc.error}\nPlease try again shortly.",
+        )
+        return
+    await send_message(
+        ctx.chat_id,
+        f"FFGlory account: {bal.total:.0f} credits "
+        f"({bal.basic:.0f} basic + {bal.premium:.0f} premium)",
+    )
+
+
+async def cmd_ffregions(ctx: Ctx) -> None:
+    api = await _ff_or_warn(ctx)
+    if api is None:
+        return
+    try:
+        pricing = await api.pricing()
+    except GloryAPIError as exc:
+        await send_message(ctx.chat_id, f"FFGlory prices check failed ({exc.status}): {exc.error}")
+        return
+    rows = pricing.get("regions") or []
+    if not rows:
+        await send_message(ctx.chat_id, "No regions found at FFGlory pricing endpoint.")
+        return
+    lines = []
+    for row in rows:
+        lines.append(
+            f"  {row.get('id'):6s}  {row.get('region_name', ''):15s}  "
+            f"tier={row.get('tier')}  enabled={row.get('enabled')}"
+        )
+    basic_price = ctx.pricing.final_price(ctx.pricing.basic_credit_bdt)
+    await send_message(
+        ctx.chat_id,
+        "FFGlory regions:\n"
+        + "\n".join(lines)
+        + f"\n\nBasic credit price: ${pricing.get('basic_credit_usd')} / credit"
+        f"\nPremium credit price: ${pricing.get('premium_credit_usd')} / credit"
+        f"\n\nYour price per launch: ৳{_money(basic_price)}",
+    )
+
+
+async def cmd_fflaunch(ctx: Ctx) -> None:
+    """/fflaunch <region> <clan_id> — same flow as the Basic menu."""
+    if len(ctx.args) < 2:
+        await send_message(ctx.chat_id, "Usage: /fflaunch <region> <clan_id>")
+        return
+    region = ctx.args[0].strip().lower()
+    clan_id = ctx.args[1].strip()
+    if not CLAN_RE.match(clan_id):
+        await send_message(ctx.chat_id, "clan_id must be 4-20 letters or numbers.")
+        return
+    await launch_basic(ctx, region, clan_id)
+
+
+async def cmd_ffgroups(ctx: Ctx) -> None:
+    api = await _ff_or_warn(ctx)
+    if api is None:
+        return
+    try:
+        groups = await api.my_groups()
+    except GloryAPIError as exc:
+        await send_message(ctx.chat_id, f"Groups check failed ({exc.status}): {exc.error}")
+        return
+    if not groups:
+        await send_message(ctx.chat_id, "No groups found yet.")
+        return
+    lines = [f"  {g.group_id[:8]}  {g.status:8s}  {g.region:4s}  {g.uptime}" for g in groups]
+    await send_message(ctx.chat_id, "Your groups:\n" + "\n".join(lines))
+
+
+async def cmd_ffglory(ctx: Ctx) -> None:
+    api = await _ff_or_warn(ctx)
+    if api is None:
+        return
+    if not ctx.args:
+        await send_message(ctx.chat_id, "Usage: /ffglory <group_id>")
+        return
+    group_id = ctx.args[0].strip()
+    try:
+        resp = await api.group_glory(group_id)
+    except GloryAPIError as exc:
+        await send_message(ctx.chat_id, f"Glory check failed ({exc.status}): {exc.error}")
+        return
+    clanname = resp.get("clan_name") or resp.get("clan_id") or "-"
+    note = ""
+    if isinstance(resp.get("glory"), (int, float)):
+        note = f"\nGlory: {float(resp['glory']):,.0f}"
+    await send_message(ctx.chat_id, f"Group {group_id}: {clanname}{note}")
+
+
+async def cmd_ffcoupons(ctx: Ctx) -> None:
+    api = await _ff_or_warn(ctx)
+    if api is None:
+        return
+    try:
+        coupons = await api.my_coupons()
+    except GloryAPIError as exc:
+        await send_message(ctx.chat_id, f"Coupons check failed ({exc.status}): {exc.error}")
+        return
+    if not coupons:
+        await send_message(ctx.chat_id, "No coupons created yet.")
+        return
+    lines = [
+        f"  {c.code}  {c.status:8s}  basic={c.basic_credits}  premium={c.premium_credits}"
+        for c in coupons
+    ]
+    await send_message(ctx.chat_id, "Your coupons:\n" + "\n".join(lines))
+
+
+async def cmd_ffredeem(ctx: Ctx) -> None:
+    api = await _ff_or_warn(ctx)
+    if api is None:
+        return
+    if not ctx.args:
+        await send_message(ctx.chat_id, "Usage: /ffredeem <code>")
+        return
+    code = ctx.args[0].strip().upper().replace("-", "")
+    try:
+        resp = await api.redeem_coupon(code=code)
+    except GloryAPIError as exc:
+        await send_message(ctx.chat_id, f"Redeem failed ({exc.status}): {exc.error}")
+        return
+    msg = "Coupon redeemed:"
+    for key, value in resp.items():
+        if key not in ("success", "message"):
+            msg += f"\n  {key}: {value}"
+    await send_message(ctx.chat_id, msg)
+
+
+async def cmd_ffnotifs(ctx: Ctx) -> None:
+    api = await _ff_or_warn(ctx)
+    if api is None:
+        return
+    try:
+        notifs = await api.notifications()
+    except GloryAPIError as exc:
+        await send_message(ctx.chat_id, f"Notifications check failed ({exc.status}): {exc.error}")
+        return
+    if not notifs:
+        await send_message(ctx.chat_id, "No pending notifications.")
+        return
+    lines = [
+        f"  [{n.get('type', '?')}] {n.get('title')}: {n.get('message', '')}" for n in notifs
+    ]
+    await send_message(ctx.chat_id, "Notifications:\n" + "\n".join(lines))
+
+
+COMMANDS = {
+    "/start": cmd_start,
+    "/menu": cmd_menu,
+    "/help": cmd_help,
+    "/balance": cmd_balance,
+    "/admin": cmd_admin,
+    "/bkash": cmd_bkash,
+    "/binance": cmd_binance,
+    "/ffbalance": cmd_ffbalance,
+    "/ffregions": cmd_ffregions,
+    "/fflaunch": cmd_fflaunch,
+    "/ffgroups": cmd_ffgroups,
+    "/ffglory": cmd_ffglory,
+    "/ffcoupons": cmd_ffcoupons,
+    "/ffredeem": cmd_ffredeem,
+    "/ffnotifs": cmd_ffnotifs,
+}
