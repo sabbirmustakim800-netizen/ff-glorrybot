@@ -234,4 +234,4 @@ def test_fastapi_app_imports():
     from app.handlers import COMMANDS, app
 
     assert app.title == "FF Glory Bot"
-    assert set(COMMANDS) >= {"/start", "/help", "/balance", "/bkash", "/binance"}
+    assert set(COMMANDS) >= {"/start", "/help", "/balance", "/bkash", "/binance", "/ffbalance", "/ffregions", "/fflaunch", "/ffgroups", "/ffglory", "/ffcoupons", "/ffredeem", "/ffnotifs"}
