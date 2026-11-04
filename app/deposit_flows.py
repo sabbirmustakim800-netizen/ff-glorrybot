@@ -16,6 +16,7 @@ from . import db
 from . import deposits
 from . import keyboards as kb
 from .telegram import send_message
+from .tokens import fmt_tokens
 from .ui import (
     Ctx,
     _config_hint,
@@ -37,10 +38,14 @@ logger = logging.getLogger("bot")
 
 
 async def show_deposit(ctx: Ctx) -> None:
+    cfg = ctx.token_cfg
     text = (
         "Deposit / Top-up\n\n"
         "bKash — pay in Taka (৳) to our number, then confirm the TrxID here.\n"
         "Crypto — USDT TRC20/BEP20 with a dedicated address per deposit.\n\n"
+        f"Rate: {cfg.rate_line()} — a ৳{min_deposit(ctx):g} deposit gives "
+        f"{cfg.tokens_for_bdt(min_deposit(ctx)):,} tokens.\n\n"
+        "Everything you buy afterwards is priced in tokens only.\n\n"
         "Pick a method:"
     )
     await respond(ctx, text, kb.deposit_menu())
@@ -68,9 +73,10 @@ async def show_bkash_deposit(ctx: Ctx) -> None:
         "bKash Deposit\n\n"
         f"Send money (personal) to: {number}\n"
         f"Amounts are in Bangladeshi Taka (৳) only.\n"
-        f"Minimum deposit: ৳{min_deposit(ctx):g}\n\n"
+        f"Minimum deposit: ৳{min_deposit(ctx):g}\n"
+        f"Rate: {ctx.token_cfg.rate_line()} (tokens are credited, not cash)\n\n"
         "Tap Start Deposit and enter the number you paid from, the TrxID from "
-        "the confirmation SMS and the amount. Your balance is credited after "
+        "the confirmation SMS and the amount. Tokens are credited after "
         "verification and each TrxID can only be used once."
         f"{support}"
     )
@@ -116,8 +122,10 @@ async def _bkash_review(ctx: Ctx, sender: str, trx: str, amount: float) -> None:
         "bKash Deposit — confirm\n\n"
         f"Sender: {sender}\n"
         f"TrxID: {trx}\n"
-        f"Amount: ৳{_money(amount)} BDT\n\n"
-        "Check the details, then confirm. Your balance is credited after "
+        f"You pay: ৳{_money(amount)} BDT\n"
+        f"You receive: {fmt_tokens(ctx.token_cfg.tokens_for_bdt(amount))} "
+        f"({ctx.token_cfg.rate_line()})\n\n"
+        "Check the details, then confirm. Tokens are credited after "
         "verification.",
         kb.bkash_confirm(),
     )
@@ -151,7 +159,12 @@ async def _bkash_process(
         "bkash",
         trx,
         ctx.user_id,
-        {"sender": sender, "amount_bdt": amount, "source": "guided_form"},
+        {
+            "sender": sender,
+            "amount_bdt": amount,
+            "tokens": ctx.token_cfg.tokens_for_bdt(amount or 0),
+            "source": "guided_form",
+        },
     )
     if action == "busy" or not pid:
         await send_message(
@@ -190,9 +203,10 @@ async def _bkash_manual_review(
         "Deposit submitted for verification.\n\n"
         f"TrxID: {trx}\n"
         f"Sender: {sender}\n"
-        f"Amount: ৳{_money(amount or 0)} BDT\n"
+        f"Paid: ৳{_money(amount or 0)}\n"
+        f"Tokens: {fmt_tokens(ctx.token_cfg.tokens_for_bdt(amount or 0))}\n"
         f"Reference: #{pid[-6:]}\n\n"
-        "An admin will confirm it and your balance will be credited here.",
+        "An admin will confirm it and your tokens will be credited here.",
         kb.main_menu(ctx.is_admin),
     )
     await notify_admins(
@@ -211,7 +225,8 @@ async def show_crypto_deposit(ctx: Ctx) -> None:
         "Crypto Deposit (USDT)\n\n"
         "Pick the network you will pay with. Every deposit gets its own address "
         "and an exact amount to send, so your payment is matched to your "
-        "account automatically.\n\n"
+        "account automatically.\n"
+        f"Rate: {ctx.token_cfg.rate_line()}\n\n"
         "Send only USDT on the selected network."
     )
     await respond(ctx, text, kb.crypto_networks())
@@ -258,8 +273,8 @@ async def crypto_start(ctx: Ctx, coin: str, network: str) -> None:
         ctx,
         f"Crypto Deposit — {deposits.network_label(net)}\n\n"
         f"Send the amount in BDT you want to deposit (minimum ৳{min_deposit(ctx):g}). "
-        "We convert it at the current rate and show you the exact amount and "
-        "address to send.",
+        f"It is credited as tokens at {ctx.token_cfg.rate_line()}, and we show "
+        "you the exact amount and address to send.",
         _amount_buttons(ctx, f"d:c:amt:{net}:"),
     )
 
@@ -313,6 +328,7 @@ async def _crypto_create(ctx: Ctx, coin: str, net: str, amount_bdt: float) -> No
 
     coin_amount = round(float(amount_bdt) / float(rate), 2)
     expected = deposits.reference_amount(coin_amount)
+    tokens = ctx.token_cfg.tokens_for_bdt(amount_bdt)
     meta = {
         "coin": coin,
         "network": net,
@@ -320,6 +336,7 @@ async def _crypto_create(ctx: Ctx, coin: str, net: str, amount_bdt: float) -> No
         "tag": tag,
         "expected": expected,
         "requested_bdt": round(float(amount_bdt), 2),
+        "tokens": tokens,
         "rate": float(rate),
         "automatic": automatic,
         "address_source": source,
@@ -339,6 +356,7 @@ async def _crypto_create(ctx: Ctx, coin: str, net: str, amount_bdt: float) -> No
         f"Amount: {expected:g} {coin}",
         f"Network: {deposits.network_label(net)}",
         f"Address: {address}",
+        f"You receive: {fmt_tokens(tokens)}",
     ]
     if tag:
         lines.append(f"Memo/Tag: {tag}")
@@ -481,8 +499,10 @@ async def _crypto_credit(ctx: Ctx, pid: str, meta: dict, record: dict) -> None:
         )
         return
 
-    credit = round(amount * rate, 2)
-    if not await db.credit_payment(bpid, ctx.user_id, credit):
+    credit_bdt = round(amount * rate, 2)
+    # The deposit buys tokens; the Taka value only exists in the ledger.
+    tokens = ctx.token_cfg.tokens_for_bdt(meta.get("requested_bdt") or credit_bdt)
+    if not await db.credit_payment(bpid, ctx.user_id, tokens):
         await db.finish_payment(pid, "needs_review", reason="credit_race")
         await send_message(
             ctx.chat_id,
@@ -494,14 +514,20 @@ async def _crypto_credit(ctx: Ctx, pid: str, meta: dict, record: dict) -> None:
         pid,
         "verified",
         reason="session_matched",
-        details={"txid": txid, "amount": amount, "credit_bdt": credit},
+        details={
+            "txid": txid,
+            "amount": amount,
+            "credit_bdt": credit_bdt,
+            "credited_tokens": tokens,
+        },
     )
-    balance = await db.get_balance(ctx.user_id)
+    balance = await db.get_tokens(ctx.user_id)
     await send_message(
         ctx.chat_id,
         "Crypto deposit confirmed.\n\n"
-        f"{amount:g} {coin} × {rate:g} = ৳{_money(credit)} credited.\n\n"
-        f"New balance: ৳{_money(balance)}",
+        f"Received: {amount:g} {coin}\n"
+        f"Credited: {fmt_tokens(tokens)}\n\n"
+        f"New balance: {fmt_tokens(balance)}",
         kb.main_menu(ctx.is_admin),
     )
 
@@ -566,8 +592,9 @@ async def _crypto_manual_txid(ctx: Ctx, pid: str, txid: str) -> None:
         "Deposit submitted for verification.\n\n"
         f"Transaction: {txid}\n"
         f"Amount: {meta.get('expected')} {meta.get('coin')}\n"
+        f"Tokens: {fmt_tokens(meta.get('tokens') or 0)}\n"
         f"Reference: #{pid[-6:]}\n\n"
-        "An admin will confirm it and your balance will be credited here.",
+        "An admin will confirm it and your tokens will be credited here.",
         kb.main_menu(ctx.is_admin),
     )
     await notify_admins(
@@ -575,6 +602,8 @@ async def _crypto_manual_txid(ctx: Ctx, pid: str, txid: str) -> None:
         f"User: {ctx.name} ({ctx.user_id})\n"
         f"Network: {deposits.network_label(meta.get('network'))}\n"
         f"Expected: {meta.get('expected')} {meta.get('coin')}\n"
+        f"Taka: ৳{_money(meta.get('requested_bdt') or 0)} → "
+        f"{fmt_tokens(meta.get('tokens') or 0)}\n"
         f"Transaction: {txid}\n"
         f"Reference: #{pid[-6:]}",
         kb.payment_review(pid),
@@ -606,6 +635,7 @@ async def _resolve_bkash(
             )
             return
         amount = check.amount
+        tokens = ctx.token_cfg.tokens_for_bdt(amount or 0)
         if amount is None or amount <= 0:
             await db.finish_payment(
                 pid, "needs_review", reason="amount_not_returned", details=details
@@ -622,10 +652,10 @@ async def _resolve_bkash(
                 f"Reference: #{pid[-6:]} — an admin will credit your account.",
             )
             return
-        if not await db.credit_payment(pid, ctx.user_id, amount):
+        if not await db.credit_payment(pid, ctx.user_id, tokens):
             await send_message(ctx.chat_id, "This payment has already been processed.")
             return
-        balance = await db.get_balance(ctx.user_id)
+        balance = await db.get_tokens(ctx.user_id)
         note = ""
         if declared is not None and abs(declared - amount) > 0.01:
             note += f"\nYou declared ৳{_money(declared)}; verified amount is ৳{_money(amount)}."
@@ -636,8 +666,9 @@ async def _resolve_bkash(
             f"bKash payment verified.\n"
             f"TrxID: {trx}\n"
             f"Sender: {check.sender or 'n/a'}\n"
-            f"Amount: ৳{_money(amount)}\n\n"
-            f"New balance: ৳{_money(balance)}{note}",
+            f"Paid: ৳{_money(amount)}\n"
+            f"Credited: {fmt_tokens(tokens)}\n\n"
+            f"New balance: {fmt_tokens(balance)}{note}",
             kb.main_menu(ctx.is_admin),
         )
         return
