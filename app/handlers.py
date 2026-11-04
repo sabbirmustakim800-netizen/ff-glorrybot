@@ -30,12 +30,14 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
 import os
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -45,6 +47,7 @@ import httpx
 from . import bkash as bkash_api
 from . import binance as binance_api
 from . import db
+from . import deposits
 from . import keyboards as kb
 from .config import Pricing, Settings, get_settings, parse_rates
 from .glory_api import GloryAPI, GloryAPIError, extract_group_id
@@ -88,166 +91,45 @@ API_KEYS = list(API_FIELDS)
 ADMIN_DENIED = "Access denied. This command and panel are for administrators only."
 
 
-# ------------------------------------------------------------------------ helpers
-
-
-def _display_name(sender: dict) -> str:
-    return str(sender.get("first_name") or sender.get("username") or "User")
-
-
-def _parse_amount(raw: str) -> float | None:
-    try:
-        value = float(str(raw).replace(",", "").replace("৳", "").strip())
-    except (TypeError, ValueError):
-        return None
-    return value if value > 0 else None
-
-
-def _money(value: float) -> str:
-    return f"{float(value or 0):.2f}"
-
-
-def _short(order: dict | str) -> str:
-    raw = order.get("_id") if isinstance(order, dict) else order
-    return str(raw or "")[-6:]
-
-
-def _mask(value: str) -> str:
-    text = str(value or "")
-    if not text:
-        return "not set"
-    if len(text) <= 8:
-        return "set"
-    return f"{text[:4]}...{text[-3:]}"
-
-
-def _help_text(is_admin: bool) -> str:
-    text = (
-        "FF Glory Bot — commands\n\n"
-        "/start — main menu\n"
-        "/balance — show your current balance\n\n"
-        "Deposits:\n"
-        "/bkash <TrxID> <sender_number> [amount]\n"
-        "  Example: /bkash BFD90JRLST 01712345678 500\n"
-        "/binance <COIN> <txId> [amount]\n"
-        "  Example: /binance USDT 98A3EA560C6B3336... 10\n\n"
-        "FF Glory:\n"
-        "/ffbalance — account credits\n"
-        "/ffregions — regions & prices\n"
-        "/fflaunch <region> <clan_id> — launch a glory group\n"
-        "/ffgroups — your glory groups\n"
-        "/ffglory <group_id> — current glory of a group\n"
-        "/ffcoupons — your coupons\n"
-        "/ffredeem <code> — redeem a coupon code\n"
-        "/ffnotifs — pending notifications"
-    )
-    if is_admin:
-        text += "\n\nAdmin:\n/admin — control panel"
-    return text
-
-
-@dataclass
-class Ctx:
-    chat_id: int
-    user_id: int
-    name: str
-    args: list[str]
-    settings: Settings
-    client: httpx.AsyncClient
-    api: dict
-    pricing: Pricing
-    is_admin: bool = False
-    message_id: int | None = None
-    user_api_key: str = ""
-    key_loaded: bool = False
-
-
-async def load_runtime(settings: Settings) -> tuple[dict, Pricing]:
-    """Merge admin panel overrides (Mongo) over environment settings."""
-    doc: dict = {}
-    try:
-        doc = await db.get_bot_settings()
-    except Exception:  # DB down must not crash a menu render
-        logger.warning("bot settings unavailable; falling back to env", exc_info=True)
-    overrides = doc.get("api") or {}
-
-    def pick(name: str, env_value: str) -> str:
-        value = str(overrides.get(name) or "").strip()
-        return value or env_value
-
-    rates = parse_rates(str(overrides.get("BDT_RATES") or "")) or dict(settings.bdt_rates)
-    api = {
-        "ffglory_api_key": pick("FFGLORY_API_KEY", settings.ffglory_api_key),
-        "ffglory_master_key": pick("FFGLORY_MASTER_KEY", settings.ffglory_master_key),
-        "ffglory_base_url": pick(
-            "FFGLORY_BASE_URL", settings.ffglory_base_url or "https://ffglory.pro"
-        ),
-        "bkash_base_url": pick("BKASH_API_BASE_URL", settings.bkash_base_url),
-        "bkash_api_key": pick("BKASH_API_KEY", settings.bkash_api_key),
-        "binance_api_key": pick("BINANCE_API_KEY", settings.binance_api_key),
-        "binance_api_secret": pick("BINANCE_API_SECRET", settings.binance_api_secret),
-        "usdt_trc20": pick("USDT_TRC20", settings.usdt_trc20_address),
-        "usdt_bep20": pick("USDT_BEP20", settings.usdt_bep20_address),
-        "rates": rates,
-        "overrides": overrides,
-    }
-    return api, Pricing.from_doc(doc, settings)
-
-
-async def ensure_user_key(ctx: Ctx) -> str:
-    if not ctx.key_loaded:
-        try:
-            ctx.user_api_key = await db.get_user_api_key(ctx.user_id)
-        except Exception:
-            logger.warning("could not load user api key", exc_info=True)
-            ctx.user_api_key = ""
-        ctx.key_loaded = True
-    return ctx.user_api_key
-
-
-def glory_client(ctx: Ctx, *, platform: bool = False) -> GloryAPI:
-    """Client bound to the user's own key, or the platform key."""
-    key = ctx.api["ffglory_api_key"]
-    if not platform and ctx.user_api_key:
-        key = ctx.user_api_key
-    return GloryAPI(
-        base_url=ctx.api["ffglory_base_url"],
-        master_key=ctx.api["ffglory_master_key"],
-        api_key=key,
-    )
-
-
-def bkash_settings(ctx: Ctx) -> Settings:
-    return replace(
-        ctx.settings,
-        bkash_base_url=ctx.api["bkash_base_url"],
-        bkash_api_key=ctx.api["bkash_api_key"],
-    )
-
-
-def binance_settings(ctx: Ctx) -> Settings:
-    return replace(
-        ctx.settings,
-        binance_api_key=ctx.api["binance_api_key"],
-        binance_api_secret=ctx.api["binance_api_secret"],
-    )
-
-
-async def respond(ctx: Ctx, text: str, markup: dict | None = None) -> None:
-    """Edit the callback's message when possible, else send a new one."""
-    if ctx.message_id:
-        if await edit_message(ctx.chat_id, ctx.message_id, text, markup):
-            return
-    await send_message(ctx.chat_id, text, markup)
-
-
-async def notify_admins(text: str, markup: dict | None = None) -> int:
-    settings = get_settings()
-    sent = 0
-    for admin_id in settings.admin_ids:
-        if await send_message(admin_id, text, markup):
-            sent += 1
-    return sent
+from .deposit_flows import (
+    _amount_buttons,
+    _bkash_review,
+    _crypto_create,
+    _crypto_manual_txid,
+    _resolve_bkash,
+    bkash_quick_amount,
+    bkash_start,
+    bkash_submit,
+    crypto_cancel,
+    crypto_check,
+    crypto_quick_amount,
+    crypto_route,
+    crypto_start,
+    crypto_txid_prompt,
+    show_bkash_deposit,
+    show_crypto_deposit,
+    show_deposit,
+)
+from .ui import (
+    Ctx,
+    _config_hint,
+    _display_name,
+    _error_ref,
+    _help_text,
+    _mask,
+    _money,
+    _parse_amount,
+    _short,
+    bkash_number,
+    bkash_settings,
+    binance_settings,
+    ensure_user_key,
+    glory_client,
+    load_runtime,
+    min_deposit,
+    notify_admins,
+    respond,
+)
 
 
 # --------------------------------------------------------------------- HTTP routes
@@ -311,7 +193,7 @@ async def process_update(data: dict) -> None:
             return
 
         settings = get_settings()
-        api, pricing = await load_runtime(settings)
+        api, pricing, payment = await load_runtime(settings)
         ctx = Ctx(
             chat_id=chat_id,
             user_id=user_id,
@@ -321,6 +203,7 @@ async def process_update(data: dict) -> None:
             client=http_client(),
             api=api,
             pricing=pricing,
+            payment=payment,
             is_admin=settings.is_admin(user_id),
             message_id=message.get("message_id"),
         )
@@ -373,7 +256,7 @@ async def handle_callback(callback: dict) -> None:
     if not isinstance(chat_id, int) or not isinstance(user_id, int):
         return
     try:
-        api, pricing = await load_runtime(settings)
+        api, pricing, payment = await load_runtime(settings)
         ctx = Ctx(
             chat_id=chat_id,
             user_id=user_id,
@@ -383,6 +266,7 @@ async def handle_callback(callback: dict) -> None:
             client=http_client(),
             api=api,
             pricing=pricing,
+            payment=payment,
             is_admin=settings.is_admin(user_id),
             message_id=message.get("message_id"),
         )
@@ -393,7 +277,7 @@ async def handle_callback(callback: dict) -> None:
 
 
 async def route_callback(ctx: Ctx, data: str) -> None:
-    if data.startswith(("a:", "o:")) and not ctx.is_admin:
+    if data.startswith(("a:", "o:", "pay:")) and not ctx.is_admin:
         await send_message(ctx.chat_id, ADMIN_DENIED)
         return
 
@@ -416,10 +300,19 @@ async def route_callback(ctx: Ctx, data: str) -> None:
         await show_deposit(ctx)
     elif data == "d:bkash":
         await show_bkash_deposit(ctx)
-    elif data == "d:bkash:how":
-        await show_bkash_deposit(ctx)
+    elif data == "d:b:start":
+        await bkash_start(ctx)
+    elif data == "d:b:go":
+        await bkash_submit(ctx)
+    elif data == "d:b:cancel":
+        await db.clear_state(ctx.user_id)
+        await show_deposit(ctx)
+    elif data.startswith("d:b:amt:"):
+        await bkash_quick_amount(ctx, data[8:])
     elif data == "d:crypto":
         await show_crypto_deposit(ctx)
+    elif data.startswith("d:c:"):
+        await crypto_route(ctx, data[4:])
     elif data == "m:account":
         await show_account(ctx)
     elif data == "ac:history":
@@ -436,6 +329,10 @@ async def route_callback(ctx: Ctx, data: str) -> None:
         await admin_pricing(ctx)
     elif data.startswith("a:pr:"):
         await admin_pricing_action(ctx, data[5:])
+    elif data == "a:pay":
+        await admin_payment(ctx)
+    elif data.startswith("a:pay:"):
+        await admin_payment_action(ctx, data[6:])
     elif data == "a:api":
         await admin_api_menu(ctx)
     elif data.startswith("a:api:set:"):
@@ -456,6 +353,12 @@ async def route_callback(ctx: Ctx, data: str) -> None:
         await admin_decide(ctx, data[5:], approve=False)
     elif data.startswith("o:pf:"):
         await admin_proof_prompt(ctx, data[5:])
+    elif data.startswith("pay:v:"):
+        await admin_payment_review(ctx, data[6:])
+    elif data.startswith("pay:ok:"):
+        await admin_payment_decide(ctx, data[7:], approve=True)
+    elif data.startswith("pay:no:"):
+        await admin_payment_decide(ctx, data[7:], approve=False)
     else:
         await show_main(ctx)
 
@@ -518,14 +421,13 @@ async def show_basic(ctx: Ctx) -> None:
             if live:
                 regions = live
         except GloryAPIError as exc:
-            note = f"\n\nNote: live region list unavailable ({exc.status})."
+            # Diagnostics stay in the log; users only see the default regions.
+            logger.warning("live region list unavailable: %s", exc)
     text = (
         "Basic Services (Auto API)\n\n"
-        f"Price per group launch: ৳{_money(price)}\n"
-        f"Base ৳{_money(ctx.pricing.basic_credit_bdt)} + markup "
-        f"৳{_money(ctx.pricing.markup_amount(ctx.pricing.basic_credit_bdt))}\n\n"
-        "The API launches your group instantly. You are charged only after a "
-        "successful launch."
+        f"Price per group launch: ৳{_money(price)}\n\n"
+        "The API launches your group instantly and you are charged only after "
+        "a successful launch."
         f"{note}\n\nPick a region:"
     )
     await respond(ctx, text, kb.region_menu(regions))
@@ -558,8 +460,11 @@ async def launch_basic(ctx: Ctx, region: str, clan_id: str) -> None:
     if not api.configured:
         await send_message(
             ctx.chat_id,
-            "Basic service is not configured yet: the FF Glory master key or "
-            "account key is missing. Set them from the admin panel or contact support.",
+            _config_hint(
+                ctx,
+                "Basic service is not configured: FFGLORY_API_KEY / "
+                "FFGLORY_MASTER_KEY are missing. Set them in API Settings.",
+            ),
         )
         return
 
@@ -577,19 +482,23 @@ async def launch_basic(ctx: Ctx, region: str, clan_id: str) -> None:
     try:
         resp = await api.launch_group(region=region, clan_id=clan_id)
     except GloryAPIError as exc:
+        ref = _error_ref("launch", exc.status, exc.error)
+        logger.warning("launch failed user=%s ref=%s: %s", ctx.user_id, ref, exc)
         await send_message(
             ctx.chat_id,
-            f"Launch failed ({exc.status}): {exc.error}\n"
-            "You were not charged. Try again or contact support.",
+            "The launch could not be completed. You were not charged.\n"
+            f"Reference: {ref}\nTry again in a minute or contact support.",
             kb.main_menu(ctx.is_admin),
         )
         return
 
     if resp.get("success") is False:
-        message = resp.get("error") or resp.get("message") or "the API rejected the request"
+        ref = _error_ref("launch-rejected", resp.get("error"), resp.get("message"))
+        logger.warning("launch rejected user=%s ref=%s payload=%s", ctx.user_id, ref, resp)
         await send_message(
             ctx.chat_id,
-            f"Launch failed: {message}\nYou were not charged.",
+            "The provider rejected this launch. You were not charged.\n"
+            f"Reference: {ref}\nCheck the clan ID and region, or contact support.",
             kb.main_menu(ctx.is_admin),
         )
         return
@@ -751,50 +660,6 @@ async def premium_confirm(ctx: Ctx) -> None:
     if order:
         await notify_admins(_order_admin_text(order), kb.order_actions(order_id))
 
-
-# ------------------------------------------------------------------ deposits
-
-
-async def show_deposit(ctx: Ctx) -> None:
-    text = (
-        "Deposit / Top-up\n\n"
-        "bKash — send money, then verify the TrxID in the bot.\n"
-        "Crypto — USDT TRC20/BEP20, verified automatically from Binance.\n\n"
-        "Pick a method:"
-    )
-    await respond(ctx, text, kb.deposit_menu())
-
-
-async def show_bkash_deposit(ctx: Ctx) -> None:
-    support = f"\n\nSupport: {ctx.settings.support_contact}" if ctx.settings.support_contact else ""
-    text = (
-        "bKash deposit\n\n"
-        "1. Send money (personal) to the bKash number you were given.\n"
-        "2. Keep the TrxID from the confirmation SMS.\n"
-        "3. Verify it here:\n\n"
-        "/bkash <TrxID> <sender_number> [amount]\n"
-        "Example: /bkash BFD90JRLST 01712345678 500\n\n"
-        "Your balance is credited automatically after verification. Each TrxID "
-        "can be used once."
-        f"{support}"
-    )
-    await respond(ctx, text, kb.deposit_actions())
-
-
-async def show_crypto_deposit(ctx: Ctx) -> None:
-    trc20 = ctx.api["usdt_trc20"] or "ask support"
-    bep20 = ctx.api["usdt_bep20"] or "ask support"
-    text = (
-        "Crypto deposit (USDT)\n\n"
-        f"TRC20 (Tron): {trc20}\n"
-        f"BEP20 (BNB Chain): {bep20}\n\n"
-        "Send only USDT to these addresses. After sending, verify the "
-        "transaction hash here:\n\n"
-        "/binance <COIN> <txId> [amount]\n"
-        "Example: /binance USDT 98A3EA560C6B3336... 10\n\n"
-        "Your balance is credited after Binance confirms the deposit."
-    )
-    await respond(ctx, text, kb.deposit_actions())
 
 
 # -------------------------------------------------------------------- account
@@ -1032,6 +897,163 @@ async def admin_pricing_action(ctx: Ctx, key: str) -> None:
     await respond(ctx, question, kb.cancel_only("a:pricing"))
 
 
+# --------------------------------------------------------------- payments admin
+
+
+async def admin_payment(ctx: Ctx) -> None:
+    bk = bkash_settings(ctx)
+    bn = binance_settings(ctx)
+    bkash_on = "on" if (bk.bkash_base_url and bk.bkash_api_key) else "off (manual review)"
+    binance_on = (
+        "on" if (bn.binance_api_key and bn.binance_api_secret) else "off (manual review)"
+    )
+    text = (
+        "Payment settings\n\n"
+        f"bKash receiving number: {bkash_number(ctx) or 'not set'}\n"
+        f"Minimum deposit: ৳{min_deposit(ctx):g}\n"
+        f"bKash auto-verification: {bkash_on}\n"
+        f"Binance auto-verification: {binance_on}\n\n"
+        "Users see the bKash number immediately after you save it — no redeploy."
+    )
+    await respond(ctx, text, kb.admin_payment_menu())
+
+
+async def admin_payment_action(ctx: Ctx, action: str) -> None:
+    if action == "bkash":
+        await db.set_state(ctx.user_id, "admin_bkash_number", {})
+        await respond(
+            ctx,
+            "Send the bKash number that should receive deposits (01XXXXXXXXX). "
+            "It is saved instantly and shown to every user.",
+            kb.cancel_only("a:pay"),
+        )
+        return
+    if action == "min":
+        await db.set_state(ctx.user_id, "admin_min_deposit", {})
+        await respond(
+            ctx,
+            "Send the minimum deposit in BDT, for example 50.",
+            kb.cancel_only("a:pay"),
+        )
+        return
+    if action == "pending":
+        await admin_payment_queue(ctx)
+        return
+    await admin_payment(ctx)
+
+
+async def admin_payment_queue(ctx: Ctx) -> None:
+    payments = await db.list_payments(status="needs_review", limit=10)
+    if not payments:
+        await respond(
+            ctx, "No deposits are waiting for verification.", kb.admin_payment_menu()
+        )
+        return
+    lines = [f"Deposits waiting for verification ({len(payments)}):", ""]
+    rows: list[list[dict]] = []
+    for payment in payments:
+        meta = payment.get("meta") or {}
+        details = payment.get("details") or {}
+        kind = str(payment.get("kind") or "?")
+        amount = details.get("amount_bdt") or meta.get("amount_bdt")
+        when = payment.get("created_at")
+        stamp = when.strftime("%m-%d %H:%M") if isinstance(when, datetime) else "-"
+        short = str(payment.get("_id"))[-6:]
+        if amount:
+            shown = f"৳{_money(amount)}"
+        else:
+            shown = f"{meta.get('expected') or '?'} {meta.get('coin') or ''}".strip()
+        lines.append(f"#{short}  {kind}  {shown}  {stamp}")
+        rows.append([kb.button(f"Review #{short}", f"pay:v:{payment['_id']}")])
+    rows.append([kb.button("Payment Settings", "a:pay")])
+    await respond(ctx, "\n".join(lines), kb.keyboard(rows))
+
+
+async def admin_payment_review(ctx: Ctx, pid: str) -> None:
+    payment = await db.get_payment(pid)
+    if not payment:
+        await respond(ctx, "Payment not found.", kb.admin_payment_menu())
+        return
+    meta = payment.get("meta") or {}
+    details = payment.get("details") or {}
+    lines = [
+        "Deposit review",
+        "",
+        f"Reference: #{pid[-6:]}",
+        f"Kind: {payment.get('kind')}",
+        f"Status: {payment.get('status')}",
+        f"User: {payment.get('telegram_id')}",
+    ]
+    if meta.get("sender"):
+        lines.append(f"Sender: {meta['sender']}")
+    if payment.get("ref"):
+        lines.append(f"Reference code: {payment['ref']}")
+    txid = details.get("txid") or meta.get("txid")
+    if txid:
+        lines.append(f"Transaction: {txid}")
+    if meta.get("expected"):
+        lines.append(
+            f"Expected: {meta.get('expected')} {meta.get('coin')} "
+            f"({deposits.network_label(meta.get('network'))})"
+        )
+    amount_bdt = details.get("amount_bdt") or meta.get("amount_bdt")
+    if amount_bdt:
+        lines.append(f"Amount to credit: ৳{_money(amount_bdt)}")
+    lines += ["", "Approve credits the balance once; decline closes the deposit."]
+    await respond(ctx, "\n".join(lines), kb.payment_review(pid))
+
+
+async def admin_payment_decide(ctx: Ctx, pid: str, *, approve: bool) -> None:
+    payment = await db.get_payment(pid)
+    if not payment:
+        await respond(ctx, "Payment not found.", kb.admin_payment_menu())
+        return
+    telegram_id = int(payment.get("telegram_id") or 0)
+    meta = payment.get("meta") or {}
+    details = payment.get("details") or {}
+    amount = details.get("amount_bdt") or meta.get("amount_bdt") or 0
+
+    if not approve:
+        await db.finish_payment(pid, "rejected", reason="admin_declined")
+        if telegram_id:
+            await send_message(
+                telegram_id,
+                "Your deposit could not be verified, so it was not credited. "
+                "Contact support with your TrxID or transaction ID.",
+                kb.main_menu(False),
+            )
+        await respond(
+            ctx, f"Deposit #{pid[-6:]} declined.", kb.admin_payment_menu()
+        )
+        return
+
+    if not amount or float(amount) <= 0:
+        await respond(
+            ctx,
+            f"Deposit #{pid[-6:]} has no BDT amount recorded. Set BDT_RATES or "
+            "credit it manually.",
+            kb.admin_payment_menu(),
+        )
+        return
+    if not await db.credit_payment(pid, telegram_id, float(amount)):
+        await respond(ctx, "This deposit was already processed.", kb.admin_payment_menu())
+        return
+    balance = await db.get_balance(telegram_id)
+    if telegram_id:
+        await send_message(
+            telegram_id,
+            f"Deposit confirmed. ৳{_money(amount)} credited.\n\n"
+            f"New balance: ৳{_money(balance)}",
+            kb.main_menu(False),
+        )
+    await respond(
+        ctx,
+        f"Deposit #{pid[-6:]} credited: ৳{_money(amount)}.\n"
+        f"User balance: ৳{_money(balance)}",
+        kb.admin_payment_menu(),
+    )
+
+
 async def admin_api_menu(ctx: Ctx) -> None:
     overrides = ctx.api.get("overrides") or {}
     lines = ["API Settings", ""]
@@ -1171,6 +1193,88 @@ async def handle_state_input(ctx: Ctx, state: dict, text: str) -> None:
         )
         return
 
+    if action == "bkash_sender":
+        sender = bkash_api.normalize_bkash_number(text)
+        if not sender:
+            await send_message(
+                ctx.chat_id,
+                "That is not a valid bKash number. Send it like 01712345678.",
+                kb.cancel_only("d:b:cancel"),
+            )
+            return
+        await db.set_state(ctx.user_id, "bkash_trx", {"sender": sender})
+        await send_message(
+            ctx.chat_id,
+            "bKash Deposit — step 2 of 3\n\n"
+            "Send the TrxID from the bKash confirmation SMS, for example "
+            "BFD90JRLST.",
+            kb.cancel_only("d:b:cancel"),
+        )
+        return
+
+    if action == "bkash_trx":
+        trx = deposits.clean_trxid(text)
+        if not trx:
+            await send_message(
+                ctx.chat_id,
+                "That TrxID does not look right — it is 8-20 letters and numbers. "
+                "Send it again.",
+                kb.cancel_only("d:b:cancel"),
+            )
+            return
+        data["trx"] = trx
+        await db.set_state(ctx.user_id, "bkash_amount", data)
+        await send_message(
+            ctx.chat_id,
+            "bKash Deposit — step 3 of 3\n\n"
+            "Send the amount you paid in Taka (৳) only "
+            f"(minimum ৳{min_deposit(ctx):g}).",
+            _amount_buttons(ctx, "d:b:amt:"),
+        )
+        return
+
+    if action == "bkash_amount":
+        amount, error = deposits.parse_amount(text, minimum=min_deposit(ctx))
+        if error:
+            await send_message(
+                ctx.chat_id, error, _amount_buttons(ctx, "d:b:amt:")
+            )
+            return
+        await _bkash_review(
+            ctx,
+            str(data.get("sender") or ""),
+            str(data.get("trx") or ""),
+            amount,
+        )
+        return
+
+    if action == "crypto_amount":
+        net = deposits.normalize_network(str(data.get("network") or ""))
+        amount, error = deposits.parse_amount(text, minimum=min_deposit(ctx))
+        if error or not net:
+            await send_message(
+                ctx.chat_id,
+                error or "Pick the network again.",
+                _amount_buttons(ctx, f"d:c:amt:{net or 'trc20'}:"),
+            )
+            return
+        await db.clear_state(ctx.user_id)
+        await _crypto_create(ctx, str(data.get("coin") or "USDT"), net, amount)
+        return
+
+    if action == "crypto_txid":
+        txid = deposits.clean_txid(text)
+        if not txid:
+            await send_message(
+                ctx.chat_id,
+                "That does not look like a transaction hash. Send the txId from "
+                "your wallet or exchange.",
+                kb.cancel_only(f"d:c:cancel:{data.get('pid') or ''}"),
+            )
+            return
+        await _crypto_manual_txid(ctx, str(data.get("pid") or ""), txid)
+        return
+
     if action == "user_key":
         key = text.strip()
         if not re.fullmatch(r"[A-Za-z0-9_\-]{10,120}", key):
@@ -1192,6 +1296,40 @@ async def handle_state_input(ctx: Ctx, state: dict, text: str) -> None:
     if action.startswith("admin_") and not ctx.is_admin:
         await db.clear_state(ctx.user_id)
         await send_message(ctx.chat_id, ADMIN_DENIED)
+        return
+
+    if action == "admin_bkash_number":
+        number = bkash_api.normalize_bkash_number(text)
+        if not number:
+            await send_message(
+                ctx.chat_id,
+                "That is not a valid bKash number. Send it like 01712345678.",
+                kb.cancel_only("a:pay"),
+            )
+            return
+        await db.set_payment_settings(bkash_number=number)
+        ctx.payment = {**(ctx.payment or {}), "bkash_number": number}
+        await db.clear_state(ctx.user_id)
+        await send_message(
+            ctx.chat_id,
+            f"Saved. Users now see {number} for bKash deposits.",
+            kb.admin_payment_menu(),
+        )
+        return
+
+    if action == "admin_min_deposit":
+        amount, error = deposits.parse_amount(text, minimum=1, maximum=deposits.MAX_DEPOSIT_BDT)
+        if error:
+            await send_message(ctx.chat_id, error, kb.cancel_only("a:pay"))
+            return
+        await db.set_payment_settings(min_deposit_bdt=amount)
+        ctx.payment = {**(ctx.payment or {}), "min_deposit_bdt": amount}
+        await db.clear_state(ctx.user_id)
+        await send_message(
+            ctx.chat_id,
+            f"Saved. The minimum deposit is now ৳{amount:g}.",
+            kb.admin_payment_menu(),
+        )
         return
 
     if action in ("admin_margin", "admin_fixed", "admin_base_basic", "admin_base_premium"):
@@ -1307,7 +1445,7 @@ async def handle_media(ctx: Ctx, media: dict) -> None:
     )
 
 
-# ------------------------------------------------------------- deposits: handlers
+# -------------------------------------------------------------- deposit commands
 
 
 async def cmd_bkash(ctx: Ctx) -> None:
@@ -1315,8 +1453,11 @@ async def cmd_bkash(ctx: Ctx) -> None:
     if not (bk.bkash_base_url and bk.bkash_api_key):
         await send_message(
             ctx.chat_id,
-            "bKash verification is not configured yet "
-            "(set BKASH_API_BASE_URL and BKASH_API_KEY).",
+            _config_hint(
+                ctx,
+                "bKash verification is not configured: set BKASH_API_BASE_URL "
+                "and BKASH_API_KEY in API Settings.",
+            ),
         )
         return
     if len(ctx.args) < 2:
@@ -1365,85 +1506,17 @@ async def cmd_bkash(ctx: Ctx) -> None:
     await _resolve_bkash(ctx, pid, trx, declared, check)
 
 
-async def _resolve_bkash(
-    ctx: Ctx, pid: str, trx: str, declared: float | None, check: bkash_api.BkashCheck
-) -> None:
-    details: dict = {
-        "state": check.state,
-        "message": check.message,
-        "http_status": check.http_status,
-        "attempts": check.attempts,
-        "provider_sender": check.sender,
-        "provider_amount": check.amount,
-        "provider_time": check.timestamp.isoformat() if check.timestamp else None,
-    }
-    if isinstance(check.raw, (dict, list)):
-        details["raw"] = check.raw
-
-    if check.state == "verified":
-        if check.sender_state == "mismatch":
-            await db.finish_payment(pid, "rejected", reason="sender_mismatch", details=details)
-            await send_message(
-                ctx.chat_id,
-                "The sender number does not match this TrxID. "
-                "The payment must be sent from the number you submitted.",
-            )
-            return
-        amount = check.amount
-        if amount is None or amount <= 0:
-            await db.finish_payment(
-                pid, "needs_review", reason="amount_not_returned", details=details
-            )
-            await send_message(
-                ctx.chat_id,
-                f"TrxID {trx} verified, but the provider did not return the amount. "
-                "An admin will credit your account manually.",
-            )
-            return
-        if not await db.credit_payment(pid, ctx.user_id, amount):
-            await send_message(ctx.chat_id, "This payment has already been processed.")
-            return
-        balance = await db.get_balance(ctx.user_id)
-        note = ""
-        if declared is not None and abs(declared - amount) > 0.01:
-            note += f"\nYou declared ৳{_money(declared)}; verified amount is ৳{_money(amount)}."
-        if check.sender_state != "match":
-            note += "\nNote: the provider did not return a sender number to cross-check."
-        await send_message(
-            ctx.chat_id,
-            f"bKash payment verified.\n"
-            f"TrxID: {trx}\n"
-            f"Sender: {check.sender or 'n/a'}\n"
-            f"Amount: ৳{_money(amount)}\n\n"
-            f"New balance: ৳{_money(balance)}{note}",
-            kb.main_menu(ctx.is_admin),
-        )
-        return
-
-    await db.finish_payment(pid, "rejected", reason=check.state, details=details)
-    if check.state == "pending":
-        text = "The transaction is still pending at bKash. Wait a minute and run the command again."
-    elif check.state == "not_found":
-        text = (
-            "We could not find that TrxID yet. Check the TrxID and try again in a "
-            "minute (bKash SMS forwarding can be slow)."
-        )
-    elif check.state == "failed":
-        text = f"Verification failed: {check.message or 'transaction is not valid.'}"
-    elif check.state == "error":
-        text = f"Verification service error: {check.message}\nContact support if this keeps happening."
-    else:
-        text = "The verification service is unreachable right now. Please try again in a minute."
-    await send_message(ctx.chat_id, text)
-
 
 async def cmd_binance(ctx: Ctx) -> None:
     bn = binance_settings(ctx)
     if not (bn.binance_api_key and bn.binance_api_secret):
         await send_message(
             ctx.chat_id,
-            "Crypto verification is not configured yet "
-            "(set BINANCE_API_KEY and BINANCE_API_SECRET).",
+            _config_hint(
+                ctx,
+                "Crypto verification is not configured: set BINANCE_API_KEY "
+                "and BINANCE_API_SECRET in API Settings.",
+            ),
         )
         return
     if len(ctx.args) < 2:
@@ -1490,7 +1563,13 @@ async def cmd_binance(ctx: Ctx) -> None:
             reason="binance_error",
             details={"error": str(exc), "retryable": exc.retryable},
         )
-        await send_message(ctx.chat_id, f"Binance check failed: {exc}\nPlease try again shortly.")
+        ref = _error_ref("binance-check", exc, exc.retryable)
+        logger.warning("binance lookup failed user=%s ref=%s: %s", ctx.user_id, ref, exc)
+        await send_message(
+            ctx.chat_id,
+            f"We could not check the blockchain right now. Reference: {ref}\n"
+            "Please try again shortly.",
+        )
         return
 
     state, record = binance_api.classify(records, txid)
@@ -1535,10 +1614,9 @@ async def cmd_binance(ctx: Ctx) -> None:
 
     await db.finish_payment(pid, "rejected", reason=state, details=details)
     if state == "pending":
-        status = (record or {}).get("status")
         text = (
-            f"The deposit is still confirming on Binance (status: {status}). "
-            "Run /binance again in a few minutes."
+            "The deposit is still confirming on Binance. "
+            "Try again in a few minutes."
         )
     elif state == "rejected":
         text = "Binance reports this deposit as rejected or invalid, so it cannot be credited."
@@ -1560,11 +1638,25 @@ async def _ff_or_warn(ctx: Ctx) -> GloryAPI | None:
     if not api.configured:
         await send_message(
             ctx.chat_id,
-            "FFGlory API is not configured yet "
-            "(set FFGLORY_API_KEY and FFGLORY_MASTER_KEY in the admin panel).",
+            _config_hint(
+                ctx,
+                "FFGlory API is not configured: set FFGLORY_API_KEY and "
+                "FFGLORY_MASTER_KEY in API Settings.",
+            ),
         )
         return None
     return api
+
+
+async def _ff_failed(ctx: Ctx, what: str, exc: GloryAPIError) -> None:
+    """Log the provider detail; show the user a clean message with a reference."""
+    ref = _error_ref(what, exc.status, exc.error)
+    logger.warning("%s failed user=%s ref=%s: %s", what, ctx.user_id, ref, exc)
+    await send_message(
+        ctx.chat_id,
+        f"{what} could not be completed right now.\n"
+        f"Reference: {ref}\nPlease try again shortly or contact support.",
+    )
 
 
 async def cmd_ffbalance(ctx: Ctx) -> None:
@@ -1574,10 +1666,7 @@ async def cmd_ffbalance(ctx: Ctx) -> None:
     try:
         bal = await api.balance()
     except GloryAPIError as exc:
-        await send_message(
-            ctx.chat_id,
-            f"FFGlory check failed ({exc.status}): {exc.error}\nPlease try again shortly.",
-        )
+        await _ff_failed(ctx, "FFGlory balance check", exc)
         return
     await send_message(
         ctx.chat_id,
@@ -1593,26 +1682,24 @@ async def cmd_ffregions(ctx: Ctx) -> None:
     try:
         pricing = await api.pricing()
     except GloryAPIError as exc:
-        await send_message(ctx.chat_id, f"FFGlory prices check failed ({exc.status}): {exc.error}")
+        await _ff_failed(ctx, "Region list", exc)
         return
     rows = pricing.get("regions") or []
-    if not rows:
-        await send_message(ctx.chat_id, "No regions found at FFGlory pricing endpoint.")
+    # Only user-facing fields — no raw provider payloads or internal pricing.
+    lines = [
+        f"  {row.get('region_name') or row.get('id')}"
+        for row in rows
+        if isinstance(row, dict) and (row.get("region_name") or row.get("id"))
+    ]
+    if not lines:
+        await send_message(ctx.chat_id, "No regions are available right now.")
         return
-    lines = []
-    for row in rows:
-        lines.append(
-            f"  {row.get('id'):6s}  {row.get('region_name', ''):15s}  "
-            f"tier={row.get('tier')}  enabled={row.get('enabled')}"
-        )
     basic_price = ctx.pricing.final_price(ctx.pricing.basic_credit_bdt)
     await send_message(
         ctx.chat_id,
-        "FFGlory regions:\n"
+        "Available regions:\n"
         + "\n".join(lines)
-        + f"\n\nBasic credit price: ${pricing.get('basic_credit_usd')} / credit"
-        f"\nPremium credit price: ${pricing.get('premium_credit_usd')} / credit"
-        f"\n\nYour price per launch: ৳{_money(basic_price)}",
+        + f"\n\nPrice per launch: ৳{_money(basic_price)}",
     )
 
 
@@ -1636,7 +1723,7 @@ async def cmd_ffgroups(ctx: Ctx) -> None:
     try:
         groups = await api.my_groups()
     except GloryAPIError as exc:
-        await send_message(ctx.chat_id, f"Groups check failed ({exc.status}): {exc.error}")
+        await _ff_failed(ctx, "Group list", exc)
         return
     if not groups:
         await send_message(ctx.chat_id, "No groups found yet.")
@@ -1656,7 +1743,7 @@ async def cmd_ffglory(ctx: Ctx) -> None:
     try:
         resp = await api.group_glory(group_id)
     except GloryAPIError as exc:
-        await send_message(ctx.chat_id, f"Glory check failed ({exc.status}): {exc.error}")
+        await _ff_failed(ctx, "Glory check", exc)
         return
     clanname = resp.get("clan_name") or resp.get("clan_id") or "-"
     note = ""
@@ -1672,7 +1759,7 @@ async def cmd_ffcoupons(ctx: Ctx) -> None:
     try:
         coupons = await api.my_coupons()
     except GloryAPIError as exc:
-        await send_message(ctx.chat_id, f"Coupons check failed ({exc.status}): {exc.error}")
+        await _ff_failed(ctx, "Coupon list", exc)
         return
     if not coupons:
         await send_message(ctx.chat_id, "No coupons created yet.")
@@ -1695,12 +1782,14 @@ async def cmd_ffredeem(ctx: Ctx) -> None:
     try:
         resp = await api.redeem_coupon(code=code)
     except GloryAPIError as exc:
-        await send_message(ctx.chat_id, f"Redeem failed ({exc.status}): {exc.error}")
+        await _ff_failed(ctx, "Coupon redeem", exc)
         return
-    msg = "Coupon redeemed:"
-    for key, value in resp.items():
-        if key not in ("success", "message"):
-            msg += f"\n  {key}: {value}"
+    # Whitelisted fields only, never the raw provider response.
+    msg = "Coupon redeemed."
+    basic = resp.get("basic_credits")
+    premium = resp.get("premium_credits")
+    if basic or premium:
+        msg += f"\nBasic credits: {basic or 0}\nPremium credits: {premium or 0}"
     await send_message(ctx.chat_id, msg)
 
 
@@ -1711,7 +1800,7 @@ async def cmd_ffnotifs(ctx: Ctx) -> None:
     try:
         notifs = await api.notifications()
     except GloryAPIError as exc:
-        await send_message(ctx.chat_id, f"Notifications check failed ({exc.status}): {exc.error}")
+        await _ff_failed(ctx, "Notification check", exc)
         return
     if not notifs:
         await send_message(ctx.chat_id, "No pending notifications.")
