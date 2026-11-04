@@ -11,17 +11,21 @@ exception strings or configuration variable names.
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from dataclasses import replace
 from datetime import datetime
 
 import pytest
 
+from app import binance as binance_api
+from app import bkash as bkash_api
 from app import deposit_flows, deposits, handlers, ui
 from app import keyboards as kb
 from app.binance import build_address_params, build_deposit_params
 from app.bkash import BkashCheck
 from app.config import Pricing, get_settings
+from app.tokens import TokenConfig
 
 USER_ID = 555
 ADMIN_ID = 900
@@ -36,9 +40,16 @@ class FakeDB:
         self.states: dict[int, dict] = {}
         self.settings: dict = {}
         self.features: dict = {}
+        self.token_settings: dict = {}
         self.payments: dict[str, dict] = {}
+        # Token balances — the only currency the bot now moves.
         self.balances: dict[int, float] = {}
         self.orders: dict[str, dict] = {}
+        self.referrals: dict[int, int] = {}
+        self.referral_milestones: dict[int, int] = {}
+        self.referral_pairs: set[tuple[int, int]] = set()
+        self.coupons: dict[str, dict] = {}
+        self.user_keys: dict[int, str] = {}
         self._counter = 0
 
     def _new_id(self) -> str:
@@ -83,14 +94,133 @@ class FakeDB:
             payment["reason"] = reason
             payment["details"] = details
 
-    async def credit_payment(self, pid: str, telegram_id: int, amount: float) -> bool:
+    async def credit_payment(self, pid: str, telegram_id: int, tokens: float) -> bool:
         payment = self.payments.get(pid)
         if not payment or payment["status"] not in ("pending", "needs_review"):
             return False
         payment["status"] = "verified"
-        payment["credited_amount"] = float(amount)
-        self.balances[telegram_id] = self.balances.get(telegram_id, 0.0) + float(amount)
+        payment["credited_tokens"] = float(tokens)
+        self.balances[telegram_id] = self.balances.get(telegram_id, 0.0) + float(tokens)
         return True
+
+    async def get_tokens(self, telegram_id: int) -> float:
+        return float(self.balances.get(telegram_id, 0.0))
+
+    async def get_user_api_key(self, telegram_id: int) -> str:
+        return str(self.user_keys.get(telegram_id) or "")
+
+    async def set_user_api_key(self, telegram_id: int, api_key: str) -> None:
+        self.user_keys[int(telegram_id)] = (api_key or "").strip()
+
+    async def add_tokens(self, telegram_id: int, amount: float) -> float:
+        self.balances[telegram_id] = self.balances.get(telegram_id, 0.0) + float(amount)
+        return self.balances[telegram_id]
+
+    async def hold_tokens(self, telegram_id: int, amount: float) -> bool:
+        amount = float(amount)
+        if amount <= 0:
+            return True
+        if self.balances.get(telegram_id, 0.0) < amount:
+            return False
+        self.balances[telegram_id] -= amount
+        return True
+
+    async def get_user(self, telegram_id: int) -> dict | None:
+        return {
+            "telegram_id": telegram_id,
+            "tokens": self.balances.get(telegram_id, 0.0),
+            "referrals": self.referrals.get(telegram_id, 0),
+            "referral_milestones": self.referral_milestones.get(telegram_id, 0),
+            "discount_percent": 0,
+        }
+
+    async def get_or_create_user(self, telegram_id: int, name: str) -> tuple[dict, bool]:
+        self.balances.setdefault(telegram_id, 0.0)
+        return ({"telegram_id": telegram_id, "tokens": self.balances[telegram_id]}, False)
+
+    async def get_bot_settings(self) -> dict:
+        return {
+            "pricing": {},
+            "api": {},
+            "payment": dict(self.settings),
+            "features": dict(self.features),
+            "tokens": dict(self.token_settings),
+        }
+
+    async def set_token_settings(self, **values) -> dict:
+        self.token_settings.update({k: v for k, v in values.items() if v is not None})
+        return await self.get_bot_settings()
+
+    async def set_plan_cost(self, plan_id: str, tokens: int) -> dict:
+        plans = dict(self.token_settings.get("plan_costs") or {})
+        plans[(plan_id or "").strip().lower()] = int(tokens)
+        self.token_settings["plan_costs"] = plans
+        return await self.get_bot_settings()
+
+    async def reset_token_settings(self) -> dict:
+        self.token_settings.clear()
+        return await self.get_bot_settings()
+
+    async def referral_stats(self, telegram_id: int) -> dict:
+        return {
+            "invites": self.referrals.get(telegram_id, 0),
+            "milestones": self.referral_milestones.get(telegram_id, 0),
+            "referred_by": None,
+        }
+
+    async def register_referral(
+        self, referrer_id: int, referred_id: int, *, reward: int, goal: int
+    ) -> dict:
+        pair = (int(referrer_id), int(referred_id))
+        if referrer_id == referred_id or pair in self.referral_pairs:
+            return {
+                "credited": False,
+                "invites": self.referrals.get(referrer_id, 0),
+                "milestones_due": 0,
+            }
+        self.referral_pairs.add(pair)
+        self.referrals[referrer_id] = self.referrals.get(referrer_id, 0) + 1
+        self.balances[referrer_id] = self.balances.get(referrer_id, 0.0) + float(reward)
+        invites = self.referrals[referrer_id]
+        reached = invites // max(1, goal)
+        awarded = self.referral_milestones.get(referrer_id, 0)
+        due = max(0, reached - awarded)
+        if due:
+            self.referral_milestones[referrer_id] = reached
+        return {"credited": True, "invites": invites, "milestones_due": due}
+
+    async def create_coupon(
+        self, telegram_id: int, tokens: int, *, source: str = "referral", code: str = ""
+    ) -> dict:
+        self._counter += 1
+        coupon = {
+            "code": code or f"TEST-{self._counter:04X}",
+            "telegram_id": int(telegram_id),
+            "tokens": int(tokens),
+            "source": source,
+            "status": "active",
+        }
+        self.coupons[coupon["code"]] = coupon
+        return coupon
+
+    async def list_user_coupons(self, telegram_id: int, limit: int = 10) -> list[dict]:
+        return [
+            dict(coupon)
+            for coupon in self.coupons.values()
+            if coupon["telegram_id"] == int(telegram_id)
+        ][:limit]
+
+    async def redeem_coupon(self, code: str, telegram_id: int) -> dict:
+        coupon = self.coupons.get((code or "").strip().upper())
+        if not coupon:
+            return {"ok": False, "tokens": 0, "reason": "unknown"}
+        if coupon["telegram_id"] != int(telegram_id):
+            return {"ok": False, "tokens": 0, "reason": "not_yours"}
+        if coupon["status"] != "active":
+            return {"ok": False, "tokens": 0, "reason": "used"}
+        coupon["status"] = "redeemed"
+        self.balances[telegram_id] = self.balances.get(telegram_id, 0.0) + coupon["tokens"]
+        return {"ok": True, "tokens": coupon["tokens"], "reason": "redeemed"}
 
     async def get_payment(self, pid: str) -> dict | None:
         return self.payments.get(pid)
@@ -145,6 +275,9 @@ class Harness:
 def _api(**overrides) -> dict:
     base = {
         "rates": {"USDT": 110.0},
+        "ffglory_api_key": "",
+        "ffglory_master_key": "",
+        "ffglory_base_url": "https://ffglory.pro",
         "usdt_trc20": "TPanelTronAddress",
         "usdt_bep20": "0xPanelBscAddress",
         "bkash_base_url": "",
@@ -164,11 +297,13 @@ def make_ctx(
     api: dict | None = None,
     payment: dict | None = None,
     features: dict | None = None,
+    token_cfg: TokenConfig | None = None,
 ) -> handlers.Ctx:
     settings = replace(
         get_settings(),
         admin_ids=(USER_ID, ADMIN_ID),
         bkash_receiver_number="01712345678",
+        bot_username="ffglory_test_bot",
     )
     return handlers.Ctx(
         chat_id=user_id,
@@ -181,6 +316,7 @@ def make_ctx(
         pricing=Pricing(),
         payment=payment if payment is not None else dict(harness.fake.settings),
         features=dict(features or {}),
+        token_cfg=token_cfg or TokenConfig(),
         is_admin=is_admin,
     )
 
@@ -198,9 +334,24 @@ def harness(monkeypatch) -> Harness:
         "finish_payment",
         "credit_payment",
         "get_payment",
-        "get_balance",
+        "get_tokens",
+        "add_tokens",
+        "hold_tokens",
+        "get_user",
+        "get_or_create_user",
+        "get_user_api_key",
+        "set_user_api_key",
+        "referral_stats",
+        "register_referral",
+        "create_coupon",
+        "list_user_coupons",
+        "redeem_coupon",
         "set_payment_settings",
         "set_feature",
+        "set_token_settings",
+        "set_plan_cost",
+        "reset_token_settings",
+        "get_bot_settings",
         "list_payments",
     ):
         monkeypatch.setattr(handlers.db, name, getattr(fake, name))
@@ -222,6 +373,12 @@ def harness(monkeypatch) -> Harness:
         h.admin.append((text, markup))
         return 1
 
+    async def send_media(
+        chat_id: int, kind: str, file_id: str, caption: str = "", markup: dict | None = None
+    ) -> bool:
+        h.sent.append((chat_id, f"[{kind}] {caption}", markup))
+        return True
+
     async def fetch_deposit_address(client, settings, *, coin, network):
         return h.address
 
@@ -233,18 +390,34 @@ def harness(monkeypatch) -> Harness:
         return h.check
 
     monkeypatch.setattr(handlers, "send_message", send_message)
-    monkeypatch.setattr(handlers, "edit_message", edit_message)
-    monkeypatch.setattr(handlers, "answer_callback", answer_callback)
-    monkeypatch.setattr(handlers, "notify_admins", notify_admins)
-    # The deposit flows and the shared UI helpers bind the transport themselves.
-    monkeypatch.setattr(deposit_flows, "send_message", send_message)
-    monkeypatch.setattr(deposit_flows, "notify_admins", notify_admins)
-    monkeypatch.setattr(ui, "send_message", send_message)
-    monkeypatch.setattr(ui, "edit_message", edit_message)
-    monkeypatch.setattr(ui, "notify_admins", notify_admins)
-    monkeypatch.setattr(handlers.binance_api, "fetch_deposit_address", fetch_deposit_address)
-    monkeypatch.setattr(handlers.binance_api, "fetch_deposits", fetch_deposits)
-    monkeypatch.setattr(handlers.bkash_api, "verify_bkash_trxid", verify_bkash_trxid)
+    if hasattr(handlers, "answer_callback"):
+        monkeypatch.setattr(handlers, "answer_callback", answer_callback)
+    if hasattr(handlers, "notify_admins"):
+        monkeypatch.setattr(handlers, "notify_admins", notify_admins)
+    # Every module binds the transport itself, so patch each one it imported.
+    from app import admin_panel, basic, commands, premium, referral, state_machine
+
+    for module in (
+        handlers,
+        basic,
+        premium,
+        referral,
+        commands,
+        admin_panel,
+        state_machine,
+        deposit_flows,
+        ui,
+    ):
+        if hasattr(module, "send_message"):
+            monkeypatch.setattr(module, "send_message", send_message)
+        if hasattr(module, "edit_message"):
+            monkeypatch.setattr(module, "edit_message", edit_message)
+        if hasattr(module, "notify_admins"):
+            monkeypatch.setattr(module, "notify_admins", notify_admins)
+    monkeypatch.setattr(state_machine, "send_media", send_media)
+    monkeypatch.setattr(binance_api, "fetch_deposit_address", fetch_deposit_address)
+    monkeypatch.setattr(binance_api, "fetch_deposits", fetch_deposits)
+    monkeypatch.setattr(bkash_api, "verify_bkash_trxid", verify_bkash_trxid)
     return h
 
 
@@ -421,7 +594,9 @@ def test_crypto_check_credits_once(harness):
         }
     ]
     asyncio.run(handlers.crypto_check(ctx, pid))
-    credit = round(expected * 110.0, 2)
+    # The user asked for a ৳500 deposit, so they get 500 tokens at 1:1 — the
+    # unique reference amount (the extra fraction) is only there for matching.
+    credit = math.floor(500.0)
     assert harness.fake.balances[USER_ID] == pytest.approx(credit)
     assert harness.fake.payments[pid]["status"] == "verified"
 
