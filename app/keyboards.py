@@ -50,6 +50,7 @@ def admin_menu() -> dict[str, Any]:
         [
             [button("Pending Premium Orders", "a:pending")],
             [button("Profit Margin / Rates", "a:pricing")],
+            [button("Payment Settings", "a:pay")],
             [button("API Settings", "a:api")],
             [button("System Stats", "a:stats")],
             [button("Broadcast Message", "a:broadcast")],
@@ -104,9 +105,70 @@ def deposit_menu() -> dict[str, Any]:
 def deposit_actions() -> dict[str, Any]:
     return keyboard(
         [
-            [button("I sent the money - verify", "d:bkash:how")],
-            [button("Crypto wallets", "d:crypto")],
+            [button("Start bKash Deposit", "d:b:start")],
+            [button("Crypto / USDT", "d:crypto")],
             [button(BACK, "m:deposit")],
+        ]
+    )
+
+
+def amount_choices(prefix: str, values: list[int]) -> dict[str, Any]:
+    """Two quick-amount buttons per row; prefix + value stays under 64 bytes."""
+    rows = []
+    for index in range(0, len(values), 2):
+        pair = values[index : index + 2]
+        rows.append([button(f"৳{value}", f"{prefix}{value}") for value in pair])
+    rows.append([button(BACK, "m:deposit")])
+    return keyboard(rows)
+
+
+def bkash_confirm() -> dict[str, Any]:
+    return keyboard(
+        [
+            [button("Confirm & Verify", "d:b:go")],
+            [button("Cancel", "d:b:cancel")],
+        ]
+    )
+
+
+def crypto_networks() -> dict[str, Any]:
+    return keyboard(
+        [
+            [button("USDT TRC20 (Tron)", "d:c:usdt:trc20")],
+            [button("USDT BEP20 (BNB Chain)", "d:c:usdt:bep20")],
+            [button(BACK, "m:deposit")],
+        ]
+    )
+
+
+def crypto_session(pid: str, *, automatic: bool) -> dict[str, Any]:
+    action = f"d:c:check:{pid}" if automatic else f"d:c:tx:{pid}"
+    label = "I have paid - check now" if automatic else "Submit Transaction ID"
+    return keyboard(
+        [
+            [button(label, action)],
+            [button("Cancel Deposit", f"d:c:cancel:{pid}")],
+            [button(BACK, "m:deposit")],
+        ]
+    )
+
+
+def payment_review(pid: str) -> dict[str, Any]:
+    return keyboard(
+        [
+            [button("Credit Balance", f"pay:ok:{pid}"), button("Decline", f"pay:no:{pid}")],
+            [button("Admin Panel", "a:menu")],
+        ]
+    )
+
+
+def admin_payment_menu() -> dict[str, Any]:
+    return keyboard(
+        [
+            [button("Set bKash Number", "a:pay:bkash")],
+            [button("Set Minimum Deposit", "a:pay:min")],
+            [button("Review Deposits", "a:pay:pending")],
+            [button("Admin Panel", "a:menu")],
         ]
     )
 

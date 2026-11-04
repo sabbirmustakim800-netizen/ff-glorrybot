@@ -1,8 +1,11 @@
-"""Binance deposit verification using a read-only API key.
+"""Binance deposit APIs using a read-only API key.
 
-Flow: signed GET /sapi/v1/capital/deposit/hisrec filtered by coin + txId.
-The response is Binance's own deposit ledger, so a match means the funds
-really arrived on *your* account.
+Two endpoints are used:
+
+  * ``GET /sapi/v1/capital/deposit/address`` — the account's deposit address
+    for a coin + network, used to show a real receiving address per session;
+  * ``GET /sapi/v1/capital/deposit/hisrec`` — Binance's own deposit ledger,
+    filtered by coin / txId / time window to confirm the funds arrived.
 
 Key facts (from the official Binance API docs):
   * signing = percent-encode the query string FIRST, then HMAC-SHA256 hex
@@ -11,7 +14,7 @@ Key facts (from the official Binance API docs):
     needed — never enable withdrawals on this key, and IP-restrict it;
   * deposit status codes: 0 pending, 1 success, 2 rejected, 6 credited but
     withdrawal-locked, 7 wrong deposit, 8 awaiting user confirmation;
-  * the endpoint costs 1 IP-weight — poll politely, not in a hot loop.
+  * the endpoints cost 1 IP-weight — poll politely, not in a hot loop.
 """
 
 from __future__ import annotations
@@ -61,18 +64,44 @@ def signed_query(params: dict[str, Any], secret: str) -> str:
 def build_deposit_params(
     *,
     coin: str,
-    tx_id: str,
+    tx_id: str | None = None,
     now_ms: int | None = None,
+    start_ms: int | None = None,
     days: int = 30,
     recv_window: int = 10000,
 ) -> dict[str, Any]:
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     days = max(1, min(days, 89))  # Binance allows at most a 90-day window
+    start = now_ms - days * 86_400_000
+    if start_ms is not None:
+        # Never ask for more than the allowed window, even for old sessions.
+        start = max(int(start_ms), now_ms - 89 * 86_400_000)
+    params: dict[str, Any] = {"coin": coin}
+    if tx_id:
+        params["txId"] = tx_id
+    params.update(
+        {
+            "startTime": start,
+            "endTime": now_ms,
+            "recvWindow": recv_window,
+            "timestamp": now_ms,
+        }
+    )
+    return params
+
+
+def build_address_params(
+    *,
+    coin: str,
+    network: str,
+    now_ms: int | None = None,
+    recv_window: int = 10000,
+) -> dict[str, Any]:
+    """Params for /sapi/v1/capital/deposit/address (network = Binance code)."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     return {
         "coin": coin,
-        "txId": tx_id,
-        "startTime": now_ms - days * 86_400_000,
-        "endTime": now_ms,
+        "network": network,
         "recvWindow": recv_window,
         "timestamp": now_ms,
     }
@@ -96,15 +125,16 @@ def _error_message(resp: httpx.Response) -> str:
     return msg or f"Binance error HTTP {resp.status_code}" + (f" ({code})" if code else "")
 
 
-async def fetch_deposits(
-    client: httpx.AsyncClient, settings: Settings, *, coin: str, tx_id: str
-) -> list[dict[str, Any]]:
-    """Return deposit records matching txId for coin (possibly empty)."""
-    params = build_deposit_params(
-        coin=coin, tx_id=tx_id, recv_window=settings.binance_recv_window
-    )
+async def _signed_get(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    path: str,
+    params: dict[str, Any],
+    *,
+    what: str,
+) -> Any:
     query = signed_query(params, settings.binance_api_secret)
-    url = f"{settings.binance_base_url}/sapi/v1/capital/deposit/hisrec?{query}"
+    url = f"{settings.binance_base_url}{path}?{query}"
     try:
         resp = await client.get(
             url,
@@ -112,21 +142,80 @@ async def fetch_deposits(
             timeout=settings.binance_timeout,
         )
     except httpx.HTTPError as exc:
-        raise BinanceAPIError(f"network error: {type(exc).__name__}", retryable=True) from exc
+        raise BinanceAPIError(
+            f"network error during {what}: {type(exc).__name__}", retryable=True
+        ) from exc
 
     if resp.status_code != 200:
         message = _error_message(resp)
         retryable = resp.status_code in (429, 418) or resp.status_code >= 500
-        logger.warning("Binance deposit lookup failed: %s", message)
+        logger.warning("Binance %s failed: %s", what, message)
         raise BinanceAPIError(message, retryable=retryable)
 
     try:
-        payload = resp.json()
+        return resp.json()
     except ValueError as exc:
-        raise BinanceAPIError("Binance returned a non-JSON response", retryable=True) from exc
+        raise BinanceAPIError(
+            f"Binance returned a non-JSON response for {what}", retryable=True
+        ) from exc
+
+
+async def fetch_deposits(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    *,
+    coin: str,
+    tx_id: str | None = None,
+    start_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return deposit records for coin (optionally filtered by txId/time)."""
+    params = build_deposit_params(
+        coin=coin,
+        tx_id=tx_id,
+        start_ms=start_ms,
+        recv_window=settings.binance_recv_window,
+    )
+    payload = await _signed_get(
+        client, settings, "/sapi/v1/capital/deposit/hisrec", params, what="deposit lookup"
+    )
     if not isinstance(payload, list):
         raise BinanceAPIError("unexpected Binance response shape", retryable=True)
     return payload
+
+
+async def fetch_deposit_address(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    *,
+    coin: str,
+    network: str,
+) -> dict[str, str] | None:
+    """Return {"address", "tag", "url"} for a coin+network, or None.
+
+    None means "Binance has no address for this pair" (or the key cannot read
+    it) — callers fall back to the wallet address configured in the panel.
+    """
+    params = build_address_params(
+        coin=coin, network=network, recv_window=settings.binance_recv_window
+    )
+    try:
+        payload = await _signed_get(
+            client,
+            settings,
+            "/sapi/v1/capital/deposit/address",
+            params,
+            what="deposit address lookup",
+        )
+    except BinanceAPIError as exc:
+        logger.info("deposit address unavailable (%s/%s): %s", coin, network, exc)
+        return None
+    if not isinstance(payload, dict) or not payload.get("address"):
+        return None
+    return {
+        "address": str(payload.get("address") or ""),
+        "tag": str(payload.get("tag") or ""),
+        "url": str(payload.get("url") or ""),
+    }
 
 
 def classify(records: list[dict[str, Any]] | None, tx_id: str) -> tuple[str, dict | None]:
