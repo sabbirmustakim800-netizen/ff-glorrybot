@@ -129,6 +129,7 @@ from .ui import (
     min_deposit,
     notify_admins,
     respond,
+    user_api_enabled,
 )
 
 
@@ -193,7 +194,7 @@ async def process_update(data: dict) -> None:
             return
 
         settings = get_settings()
-        api, pricing, payment = await load_runtime(settings)
+        api, pricing, payment, features = await load_runtime(settings)
         ctx = Ctx(
             chat_id=chat_id,
             user_id=user_id,
@@ -204,6 +205,7 @@ async def process_update(data: dict) -> None:
             api=api,
             pricing=pricing,
             payment=payment,
+            features=features,
             is_admin=settings.is_admin(user_id),
             message_id=message.get("message_id"),
         )
@@ -256,7 +258,7 @@ async def handle_callback(callback: dict) -> None:
     if not isinstance(chat_id, int) or not isinstance(user_id, int):
         return
     try:
-        api, pricing, payment = await load_runtime(settings)
+        api, pricing, payment, features = await load_runtime(settings)
         ctx = Ctx(
             chat_id=chat_id,
             user_id=user_id,
@@ -267,6 +269,7 @@ async def handle_callback(callback: dict) -> None:
             api=api,
             pricing=pricing,
             payment=payment,
+            features=features,
             is_admin=settings.is_admin(user_id),
             message_id=message.get("message_id"),
         )
@@ -335,6 +338,8 @@ async def route_callback(ctx: Ctx, data: str) -> None:
         await admin_payment_action(ctx, data[6:])
     elif data == "a:api":
         await admin_api_menu(ctx)
+    elif data == "a:api:userkeys":
+        await admin_toggle_user_api(ctx)
     elif data.startswith("a:api:set:"):
         await admin_api_prompt(ctx, data[10:])
     elif data == "a:console":
@@ -668,17 +673,22 @@ async def premium_confirm(ctx: Ctx) -> None:
 async def show_account(ctx: Ctx) -> None:
     user = await db.get_user(ctx.user_id)
     balance = float((user or {}).get("balance") or 0.0)
-    api_key = await ensure_user_key(ctx)
+    api_on = user_api_enabled(ctx)
+    api_key = await ensure_user_key(ctx) if api_on else ""
     discount = int((user or {}).get("discount_percent") or 0)
+    if not api_on:
+        key_line = "API key: linking is turned off by the admin"
+    else:
+        key_line = f"API key: {'linked' if api_key else 'not linked'}"
     text = (
         "My Account\n\n"
         f"Name: {ctx.name}\n"
         f"Telegram ID: {ctx.user_id}\n"
         f"Balance: ৳{_money(balance)}\n"
         f"Discount: {discount}%\n"
-        f"API key: {'linked' if api_key else 'not linked'}"
+        f"{key_line}"
     )
-    await respond(ctx, text, kb.account_menu(bool(api_key)))
+    await respond(ctx, text, kb.account_menu(bool(api_key), api_on))
 
 
 async def show_history(ctx: Ctx) -> None:
@@ -698,6 +708,14 @@ async def show_history(ctx: Ctx) -> None:
 
 
 async def account_key_action(ctx: Ctx) -> None:
+    if not user_api_enabled(ctx):
+        await respond(
+            ctx,
+            "Linking your own API key is currently turned off by the admin. "
+            "Basic launches keep using the platform account.",
+            kb.account_menu(False, False),
+        )
+        return
     key = await ensure_user_key(ctx)
     if key:
         await db.set_user_api_key(ctx.user_id, "")
@@ -1065,12 +1083,49 @@ async def admin_api_menu(ctx: Ctx) -> None:
             shown = _mask(str(value or ""))
         source = "panel" if str(overrides.get(env_key) or "").strip() else "env"
         lines.append(f"{env_key}: {shown} [{source}]")
+    user_on = user_api_enabled(ctx)
     lines += [
         "",
+        f"User API keys (everyone): {'on' if user_on else 'off'}",
         "Tap a key to replace it from the panel. Values entered here override "
         "the environment without a redeploy.",
+        "",
+        "The toggle below decides whether users may link their own FF Glory "
+        "key. When off, their key is not used and every launch runs on the "
+        "platform account.",
     ]
-    await respond(ctx, "\n".join(lines), kb.api_settings_menu(API_KEYS))
+    await respond(ctx, "\n".join(lines), kb.api_settings_menu(API_KEYS, user_on))
+
+
+async def admin_toggle_user_api(ctx: Ctx) -> None:
+    """Enable/disable the per-user API key feature for everyone."""
+    current = user_api_enabled(ctx)
+    try:
+        doc = await db.set_feature("user_api_enabled", not current)
+    except Exception:
+        ref = _error_ref("user-api-toggle")
+        logger.warning("could not save user api flag ref=%s", ref, exc_info=True)
+        await respond(
+            ctx,
+            f"Could not save the setting right now. Reference: {ref}",
+            kb.api_settings_menu(API_KEYS, current),
+        )
+        return
+    ctx.features = dict(doc.get("features") or {})
+    now_on = user_api_enabled(ctx)
+    if now_on:
+        text = (
+            "User API keys are now on.\n\n"
+            "Users can link their own FF Glory key from My Account and their "
+            "basic launches will use it."
+        )
+    else:
+        text = (
+            "User API keys are now off.\n\n"
+            "The link option is hidden for everyone, saved user keys are no "
+            "longer used and basic launches run on the platform account."
+        )
+    await respond(ctx, text, kb.api_settings_menu(API_KEYS, now_on))
 
 
 async def admin_api_prompt(ctx: Ctx, key: str) -> None:
@@ -1276,6 +1331,14 @@ async def handle_state_input(ctx: Ctx, state: dict, text: str) -> None:
         return
 
     if action == "user_key":
+        if not user_api_enabled(ctx):
+            await db.clear_state(ctx.user_id)
+            await send_message(
+                ctx.chat_id,
+                "Linking your own API key is currently turned off by the admin.",
+                kb.account_menu(False, False),
+            )
+            return
         key = text.strip()
         if not re.fullmatch(r"[A-Za-z0-9_\-]{10,120}", key):
             await send_message(
@@ -1373,7 +1436,7 @@ async def handle_state_input(ctx: Ctx, state: dict, text: str) -> None:
         await send_message(
             ctx.chat_id,
             f"Saved {key} ({'cleared, using env' if not value else 'override active'}).",
-            kb.api_settings_menu(API_KEYS),
+            kb.api_settings_menu(API_KEYS, user_api_enabled(ctx)),
         )
         return
 
