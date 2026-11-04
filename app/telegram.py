@@ -17,6 +17,7 @@ logger = logging.getLogger("telegram")
 
 API_BASE = "https://api.telegram.org"
 _client: httpx.AsyncClient | None = None
+_username: str | None = None
 
 MEDIA_METHODS = {
     "photo": "sendPhoto",
@@ -55,6 +56,22 @@ async def api_call(method: str, payload: dict[str, Any]) -> dict | None:
     except Exception as exc:  # network / timeout — never crash the update handler
         logger.warning("%s error: %s", method, exc)
         return None
+
+
+async def bot_username() -> str:
+    """The bot's @username, for referral links. ``BOT_USERNAME`` wins (no call)."""
+    global _username
+    configured = get_settings().bot_username.lstrip("@").strip()
+    if configured:
+        return configured
+    if _username:
+        return _username
+    data = await api_call("getMe", {})
+    result = (data or {}).get("result") or {}
+    username = str(result.get("username") or "").strip()
+    if username:
+        _username = username
+    return username
 
 
 async def send_message(
