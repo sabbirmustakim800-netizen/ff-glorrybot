@@ -40,15 +40,16 @@ and credited to user balances in MongoDB.
 
 ## Inline menus, tiers and the admin panel
 
-Every screen is an inline keyboard with plain-text buttons (no emoji):
+Every screen is an inline keyboard; each label leads with one emoji and then
+plain English:
 
 ```
-Basic Services (Auto API)
-Premium / Secret Bulk
-Deposit / Top-up (bKash / Crypto)
-My Account / Balance
-Settings / API Key
-Admin Panel            <- only rendered for ADMIN_IDS
+🎮 Basic Services (Auto API)
+💎 Premium / Secret Bulk
+💳 Deposit / Top-up (bKash / Crypto)
+👤 My Account / Balance
+⚙️ Settings / API Key
+🛡 Admin Panel          <- only rendered for ADMIN_IDS
 ```
 
 **Basic tier — automated.** `app/glory_api.py` calls
@@ -58,6 +59,12 @@ balance, the API response is checked, and the balance is charged **only after
 a successful launch** (atomic `balance >= price` debit, so two taps cannot
 overdraw). The user's own API key, if linked from *Settings / API Key*, is used
 instead of the platform key. The order is written to `orders` as `completed`.
+
+Per-user keys are a switch the admin owns: *Admin Panel → API Settings → User
+API Keys* toggles them for everyone. When it is off the link option disappears
+from every account screen, keys already saved are ignored and every launch runs
+on the platform account — no redeploy and nothing lost, because turning it back
+on restores the saved keys.
 
 **Premium tier — manual approval.** The user describes the bulk/custom order in
 one message. The price is held (debited) when the order is placed, every admin
@@ -256,7 +263,8 @@ HTTP error mapping, timestamp parsing + freshness, Binance signature
 (encode-then-sign) and deposit status classification, config parsing, and app
 import wiring — plus the guided deposits: bKash form validation, Taka-only
 amounts, admin review credit/decline, crypto sessions (dynamic address, unique
-reference amount, single credit per txId) and the secret-leak guard.
+reference amount, single credit per txId), the secret-leak guard, the emoji
+button labels and the admin user-API switch.
 
 ## Custom APIs — FF Glory Reseller API
 
@@ -280,7 +288,7 @@ app/
   config.py     env settings + Pricing model (margin/markup/base prices)
   db.py         Motor client, indexes, users/payments/orders/settings/state
   telegram.py   async sendMessage, editMessage, answerCallback, media
-  keyboards.py  inline keyboards (plain-text buttons, no emoji)
+  keyboards.py  inline keyboards (one leading emoji per label)
   deposits.py   deposit rules: bKash form validation, crypto session matching
   glory_api.py  FF Glory Reseller API client (master key + account key)
   ffglory.py    compatibility shim re-exporting glory_api
