@@ -8,15 +8,18 @@ without re-exploring the repo.
 - Branch `freebuff/c026b6459f7393cb5dddbe88` (local), pushed to GitHub `main`
   through the GitHub integration commit API — local `git push` needs a token
   the sandbox does not have.
-- Tests: `.venv/bin/python -m pytest -q` → 35 passed (18 verification +
-  17 deposit/flow/security tests).
+- Tests: `.venv/bin/python -m pytest -q` → 41 passed (18 verification +
+  23 deposit/flow/security/UI tests).
 - Old bundles in `artifacts/` are from an earlier push; they are not required
   to deploy.
 
 ## What is built
 
-- Inline-keyboard menus (no emoji): Basic (auto API), Premium (manual admin
-  approval), Deposit, Account, Settings, Admin Panel.
+- Inline-keyboard menus, one leading emoji per label: Basic (auto API),
+  Premium (manual admin approval), Deposit, Account, Settings, Admin Panel.
+- Per-user FF Glory API keys with an admin master switch: Admin Panel → API
+  Settings → *User API Keys: On/Off*. Off hides the link option, ignores saved
+  keys and runs every launch on the platform account; on restores them.
 - Premium: funds held at order, admin `Approve & Complete` keeps them,
   `Reject & Refund` returns them; proof media forwarded to the buyer only.
 - Guided bKash deposit form (sender → TrxID → amount → confirm) that only

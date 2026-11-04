@@ -103,6 +103,7 @@ class Ctx:
     api: dict
     pricing: Pricing
     payment: dict = field(default_factory=dict)
+    features: dict = field(default_factory=dict)
     is_admin: bool = False
     message_id: int | None = None
     user_api_key: str = ""
@@ -117,6 +118,12 @@ def bkash_number(ctx: Ctx) -> str:
     return str(ctx.settings.bkash_receiver_number or "").strip()
 
 
+def user_api_enabled(ctx: Ctx) -> bool:
+    """Whether users may link their own FF Glory API key (admin switch)."""
+    stored = (ctx.features or {}).get("user_api_enabled")
+    return True if stored is None else bool(stored)
+
+
 def min_deposit(ctx: Ctx) -> float:
     stored = (ctx.payment or {}).get("min_deposit_bdt")
     try:
@@ -126,7 +133,7 @@ def min_deposit(ctx: Ctx) -> float:
     return value if value > 0 else deposits.MIN_DEPOSIT_BDT
 
 
-async def load_runtime(settings: Settings) -> tuple[dict, Pricing, dict]:
+async def load_runtime(settings: Settings) -> tuple[dict, Pricing, dict, dict]:
     """Merge admin panel overrides (Mongo) over environment settings."""
     doc: dict = {}
     try:
@@ -155,10 +162,19 @@ async def load_runtime(settings: Settings) -> tuple[dict, Pricing, dict]:
         "rates": rates,
         "overrides": overrides,
     }
-    return api, Pricing.from_doc(doc, settings), dict(doc.get("payment") or {})
+    return (
+        api,
+        Pricing.from_doc(doc, settings),
+        dict(doc.get("payment") or {}),
+        dict(doc.get("features") or {}),
+    )
 
 
 async def ensure_user_key(ctx: Ctx) -> str:
+    if not user_api_enabled(ctx):
+        ctx.user_api_key = ""
+        ctx.key_loaded = True
+        return ""
     if not ctx.key_loaded:
         try:
             ctx.user_api_key = await db.get_user_api_key(ctx.user_id)

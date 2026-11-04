@@ -38,7 +38,7 @@ _ready = False
 _lock = asyncio.Lock()
 
 SETTINGS_DOC_ID = "bot"
-SETTINGS_SECTIONS = ("pricing", "api", "payment")
+SETTINGS_SECTIONS = ("pricing", "api", "payment", "features")
 
 
 def utcnow() -> datetime:
@@ -293,6 +293,14 @@ async def set_payment_settings(**values) -> dict:
     """Persist deposit settings (e.g. the receiving bKash number)."""
     clean = {key: value for key, value in values.items() if value is not None}
     return await update_bot_settings("payment", clean)
+
+
+async def set_feature(name: str, enabled: bool) -> dict:
+    """Toggle a global feature flag controlled from the admin panel."""
+    key = (name or "").strip()
+    if not key:
+        raise ValueError("feature name is required")
+    return await update_bot_settings("features", {key: bool(enabled)})
 
 
 # ---------------------------------------------------------------- payment lookup
