@@ -156,6 +156,11 @@ class Settings:
     usdt_trc20_address: str = field(default_factory=lambda: _env("USDT_TRC20_ADDRESS"))
     usdt_bep20_address: str = field(default_factory=lambda: _env("USDT_BEP20_ADDRESS"))
     support_contact: str = field(default_factory=lambda: _env("SUPPORT_CONTACT"))
+    # --- Deposits (the admin panel can override the bKash number at runtime) ---
+    bkash_receiver_number: str = field(
+        default_factory=lambda: _env("BKASH_RECEIVER_NUMBER")
+    )
+    min_deposit_bdt: float = field(default_factory=lambda: _float("MIN_DEPOSIT_BDT", 50.0))
 
     @property
     def bkash_configured(self) -> bool:
@@ -270,4 +275,6 @@ def get_settings() -> Settings:
         usdt_trc20_address=_env("USDT_TRC20_ADDRESS"),
         usdt_bep20_address=_env("USDT_BEP20_ADDRESS"),
         support_contact=_env("SUPPORT_CONTACT"),
+        bkash_receiver_number=_env("BKASH_RECEIVER_NUMBER"),
+        min_deposit_bdt=_float("MIN_DEPOSIT_BDT", 50.0),
     )
