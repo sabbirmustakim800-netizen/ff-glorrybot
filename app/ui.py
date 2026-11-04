@@ -24,6 +24,8 @@ from .tokens import TokenConfig, fmt_tokens, token_balance
 
 logger = logging.getLogger("bot")
 
+ADMIN_DENIED = "Access denied. This command and panel are for administrators only."
+
 
 # ------------------------------------------------------------------------ helpers
 
