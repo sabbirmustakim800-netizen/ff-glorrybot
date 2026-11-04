@@ -4,7 +4,7 @@ Production-ready FastAPI service that runs as a Telegram bot on a VPS **or**
 Vercel with inline-keyboard menus, two order tiers (automated API + manual
 premium approval), dynamic admin-controlled pricing, and a password-free
 admin control panel built on `ADMIN_IDS`. Payments are verified automatically
-and credited to user balances in MongoDB.
+and credited to token wallets in MongoDB.
 
 - **bKash TrxID verification** — user submits `TrxID + sender number`; the bot
   checks them against your TrxID-check provider, retries transient "not found"
@@ -25,7 +25,10 @@ and credited to user balances in MongoDB.
 | `/start` | create the account and open the main menu |
 | `/menu` | main menu again |
 | `/help` | usage |
-| `/balance` | current balance |
+| `/balance` | current token balance |
+| `/referral` | your invite link, reward and goal progress |
+| `/coupons` | your token coupons |
+| `/redeem <CODE>` | redeem a token coupon |
 | `/admin` | admin control panel (**ADMIN_IDS only**) |
 | `/bkash <TrxID> <sender_number> [amount]` | optional shortcut for the bKash form |
 | `/binance <COIN> <txId> [amount]` | optional shortcut for crypto verification |
@@ -41,7 +44,22 @@ and credited to user balances in MongoDB.
 ## Inline menus, tiers and the admin panel
 
 Every screen is an inline keyboard; each label leads with one emoji and then
-plain English:
+plain English. A **permanent reply keyboard** sits at the bottom of the chat so
+nobody has to type a command:
+
+```
+🎮 Basic Services   💎 Premium
+💳 Deposit          👤 Account
+🎁 Referral         🎟 Coupons
+🌍 Categories       🔑 APIs
+🏠 Menu             ✖️ Cancel
+```
+
+The labels are matched after stripping the emoji, so `Coupons`, `🎟 Coupons`
+and `🏠 MENU` all navigate the same way (and a wizard in progress is cancelled
+by tapping the keyboard).
+
+Inline screens:
 
 ```
 🎮 Basic Services (Auto API)
@@ -52,11 +70,13 @@ plain English:
 🛡 Admin Panel          <- only rendered for ADMIN_IDS
 ```
 
-**Basic tier — automated.** `app/glory_api.py` calls
+**Basic tier — automated and API-driven.** The plan list comes from
+`GET /api/pricing` (`app/glory_api.py`); each plan is shown with the token cost
+the admin set for it (`🪙 150 — Middle East`). Launching calls
 `https://ffglory.pro/api/client/auto-clan-group` with the master key in
-`x-api-key` and an account key in `api_key`. The price is checked against the
-balance, the API response is checked, and the balance is charged **only after
-a successful launch** (atomic `balance >= price` debit, so two taps cannot
+`x-api-key` and an account key in `api_key`. The token cost is checked against
+the balance, the API response is checked, and the balance is charged **only
+after a successful launch** (atomic `tokens >= cost` debit, so two taps cannot
 overdraw). The user's own API key, if linked from *Settings / API Key*, is used
 instead of the platform key. The order is written to `orders` as `completed`.
 
@@ -75,12 +95,13 @@ full amount and notifies the user. Order data is sent **only** to admins and is
 never echoed back to other users. Proof media the admin sends (photo, video or
 document) is forwarded to the buyer only.
 
-**Dynamic pricing.** `final = base + base × margin/100 + fixed markup`. Admins
-change the margin, the fixed markup, or either base price from
-*Profit Margin / Rates*; values are stored in the `settings` document in Mongo
-and applied on the next update, no redeploy. Defaults come from
-`PROFIT_MARGIN_PERCENT`, `FIXED_MARKUP_BDT`, `BASIC_CREDIT_BDT`,
-`PREMIUM_CREDIT_BDT`.
+**Pricing lives in tokens.** The admin sets the token cost of each plan (or a
+default for all Basic plans) and of a premium order; values are stored in the
+`settings` document in Mongo and applied on the next update, no redeploy. The
+older BDT markup fields (`PROFIT_MARGIN_PERCENT`, `FIXED_MARKUP_BDT`,
+`BASIC_CREDIT_BDT`, `PREMIUM_CREDIT_BDT`) are kept only so an existing install
+still boots — the bot menu no longer shows them, *Profit Margin / Rates* simply
+opens Token Settings.
 
 **API Settings (everything pluggable from the panel).** `FFGLORY_API_KEY`,
 `FFGLORY_MASTER_KEY`, `FFGLORY_BASE_URL`, `BKASH_API_BASE_URL`, `BKASH_API_KEY`,
@@ -132,12 +153,50 @@ to the admin review queue instead.
 Sessions expire after 60 minutes and are scoped to the Telegram user who
 opened them — a callback with another user's session id is rejected.
 
-**Everything is priced in Taka.** The bKash form only accepts amounts in
-Bangladeshi Taka (৳): the receiving screen, the amount step, the summary and the
-quick-amount buttons all show ৳, and a dollar or crypto amount (`$5`, `5 USDT`)
-is refused instead of converted, so a payment can never be credited at a rate
-the user did not see. Crypto deposits stay separate: there the user still picks
-Taka but the exact coin amount is shown for the transfer.
+**Taka only where money actually changes hands.** The bKash form only accepts
+amounts in Bangladeshi Taka (৳): the receiving screen, the amount step, the
+summary and the quick-amount buttons all show ৳, and a dollar or crypto amount
+(`$5`, `5 USDT`) is refused instead of converted. Crypto deposits stay
+separate: there the user still picks a Taka amount but the exact coin amount is
+shown for the transfer. Every confirmation also states the tokens it buys
+(`You pay ৳500 → You receive 🪙 500`).
+
+## Tokens — the only currency in the UI
+
+Users never see a cash balance, a Taka price or a dollar amount. Balances,
+plans, premium orders, order history and admin summaries are all in **tokens**
+(`app/tokens.py`). The admin owns every number from *Admin Panel → 🪙 Token
+Settings*:
+
+| Setting | Meaning |
+|---|---|
+| Taka → Token Rate | how many ৳ buy one token (e.g. `৳1.5 = 1 token`) |
+| Basic Plan Cost | default token cost of a plan |
+| Premium Cost | token cost of a manual premium order |
+| Per-Plan Costs | override per plan id from the FF Glory API |
+| Referral Reward | tokens paid per joined invite |
+| Referral Goal | invites needed to earn one coupon |
+| Referral Coupon | token value of that coupon |
+
+A deposit is converted once, at the rate in force when it is verified:
+`tokens = floor(paid_taka / taka_per_token)`. Plans without an override use the
+default basic cost, so a newly added FF Glory plan is sellable immediately and
+can be re-priced in two taps.
+
+## Referrals and coupons
+
+Every user gets a personal link (`https://t.me/<bot>?start=ref_<id>`, built from
+`BOT_USERNAME` or `getMe`). When a **new** user opens it:
+
+1. the pair `(referrer, invited)` is recorded — the unique index makes a second
+   `/start` or a forwarded link unable to pay twice,
+2. the referrer receives the admin-set token reward,
+3. every time the invite count reaches the admin-set goal, one coupon is
+   issued for that milestone (`🎟 REF-…`, admin-set token value).
+
+Coupons are single-use and owned by one account: redeeming checks the owner and
+flips `active → redeemed` atomically before the tokens are added, so a double
+tap cannot pay twice. `🎟 Coupons` lists them; `/redeem <CODE>` works too.
 
 **Nothing internal reaches users.** Provider errors, HTTP statuses, payloads,
 API keys and configuration variable names are never shown in the chat. A failed
@@ -193,6 +252,11 @@ See [.env.example](.env.example) for the full annotated list:
   `SUPPORT_CONTACT`.
 - **Deposits**: `BKASH_RECEIVER_NUMBER` (initial bKash number; the admin panel
   value wins), `MIN_DEPOSIT_BDT` (default 50).
+- **Tokens**: `BOT_USERNAME` (referral links; empty = ask Telegram once),
+  `TAKA_PER_TOKEN` (default 1.0), `BASIC_TOKEN_COST` (100),
+  `PREMIUM_TOKEN_COST` (300), `REFERRAL_REWARD_TOKENS` (20),
+  `REFERRAL_GOAL` (5), `REFERRAL_COUPON_TOKENS` (100). All are initial values —
+  *Admin Panel → 🪙 Token Settings* wins and needs no redeploy.
 - **bKash provider**: `BKASH_API_BASE_URL`, `BKASH_API_KEY`,
   `BKASH_VERIFY_PATH`, request field names (`BKASH_FIELD_TRX/SENDER/AMOUNT`),
   auth header/scheme, payload mode (`json`/`form`), retry tuning,
@@ -264,7 +328,9 @@ HTTP error mapping, timestamp parsing + freshness, Binance signature
 import wiring — plus the guided deposits: bKash form validation, Taka-only
 amounts, admin review credit/decline, crypto sessions (dynamic address, unique
 reference amount, single credit per txId), the secret-leak guard, the emoji
-button labels and the admin user-API switch.
+button labels, the admin user-API switch, the token economy (rate conversion,
+per-plan costs, token-only screens), referrals (single payout per invite, goal
+coupons, coupon redemption once) and the persistent reply keyboard.
 
 ## Custom APIs — FF Glory Reseller API
 
@@ -285,20 +351,29 @@ configured" message instead of calling the API.
 
 ```
 app/
-  config.py     env settings + Pricing model (margin/markup/base prices)
-  db.py         Motor client, indexes, users/payments/orders/settings/state
-  telegram.py   async sendMessage, editMessage, answerCallback, media
-  keyboards.py  inline keyboards (one leading emoji per label)
-  deposits.py   deposit rules: bKash form validation, crypto session matching
-  glory_api.py  FF Glory Reseller API client (master key + account key)
-  ffglory.py    compatibility shim re-exporting glory_api
-  bkash.py      bKash TrxID verification adapter (retries, sender & age checks)
-  binance.py    signed Binance deposit lookup + status classification
-  ui.py         shared Ctx, text helpers and admin notifications
-  deposit_flows.py  guided bKash form + crypto session screens
-  handlers.py   FastAPI app: webhook, menus, tiers, admin panel
-api/index.py    Vercel entrypoint
-main.py         VPS entrypoint (uvicorn)
-tests/          unit tests for the verification logic
-STATE.md        short handoff note: current commit, pending env vars, next steps
+  config.py        env settings + Pricing model (margin/markup/base prices)
+  tokens.py        token economy: ৳→token rate, plan costs, referral settings
+  db.py            Motor client, indexes, users/payments/orders/settings/state,
+                   tokens, referrals, coupons
+  telegram.py      async sendMessage, editMessage, answerCallback, media
+  keyboards.py     reply + inline keyboards (one leading emoji per label)
+  deposits.py      deposit rules: bKash form validation, crypto session matching
+  glory_api.py     FF Glory Reseller API client (master key + account key)
+  ffglory.py       compatibility shim re-exporting glory_api
+  bkash.py         bKash TrxID verification adapter (retries, sender & age checks)
+  binance.py       signed Binance deposit lookup + status classification
+  ui.py            shared Ctx, text helpers, admin notifications
+  deposit_flows.py guided bKash form + crypto session screens
+  handlers.py      FastAPI app: webhook, callback routing, main menu, account
+                   (re-exports the screens below, so app.handlers.* still works)
+  basic.py         API-driven plan list, token pricing, launch
+  premium.py       manual premium orders with tokens held
+  referral.py      invite link, one-time payout, goal coupons
+  commands.py      /bkash, /binance, the /ff* commands and coupons
+  admin_panel.py   admin panel: orders, payments, API settings, token economy
+  state_machine.py every text answer (wizards, admin inputs, broadcast)
+api/index.py       Vercel entrypoint
+main.py            VPS entrypoint (uvicorn)
+tests/             unit tests for the verification logic
+STATE.md           short handoff note: current commit, pending env vars, next steps
 ```
