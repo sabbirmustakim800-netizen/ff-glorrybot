@@ -35,6 +35,7 @@ class FakeDB:
     def __init__(self) -> None:
         self.states: dict[int, dict] = {}
         self.settings: dict = {}
+        self.features: dict = {}
         self.payments: dict[str, dict] = {}
         self.balances: dict[int, float] = {}
         self.orders: dict[str, dict] = {}
@@ -101,6 +102,10 @@ class FakeDB:
         self.settings.update({k: v for k, v in values.items() if v is not None})
         return dict(self.settings)
 
+    async def set_feature(self, name: str, enabled: bool) -> dict:
+        self.features[name] = bool(enabled)
+        return {"features": dict(self.features)}
+
     async def list_payments(self, kind=None, status=None, limit=10):
         values = list(self.payments.values())
         if kind:
@@ -158,6 +163,7 @@ def make_ctx(
     is_admin: bool = False,
     api: dict | None = None,
     payment: dict | None = None,
+    features: dict | None = None,
 ) -> handlers.Ctx:
     settings = replace(
         get_settings(),
@@ -174,6 +180,7 @@ def make_ctx(
         api=api or _api(),
         pricing=Pricing(),
         payment=payment if payment is not None else dict(harness.fake.settings),
+        features=dict(features or {}),
         is_admin=is_admin,
     )
 
@@ -193,6 +200,7 @@ def harness(monkeypatch) -> Harness:
         "get_payment",
         "get_balance",
         "set_payment_settings",
+        "set_feature",
         "list_payments",
     ):
         monkeypatch.setattr(handlers.db, name, getattr(fake, name))
@@ -583,19 +591,86 @@ def test_every_callback_fits_telegram_limit():
                 assert button["text"].strip()
 
 
-def test_no_keyboards_contain_emoji():
-    """Buttons are plain text: the Taka sign is fine, emoji are not."""
-    emoji = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\u2B00-\u2BFF]")
+def test_action_buttons_start_with_an_emoji():
+    """Every action button leads with one emoji, then plain English."""
+    emoji = re.compile(
+        "^[\U0001F300-\U0001FAFF\u2190-\u21FF\u2600-\u27BF\u2B00-\u2BFF]"
+    )
     markups = [
         kb.main_menu(True),
+        kb.back_to_main(True),
         kb.admin_menu(),
-        kb.admin_payment_menu(),
+        kb.admin_pricing_menu(),
+        kb.api_settings_menu(["FFGLORY_API_KEY"]),
+        kb.console_menu(),
+        kb.deposit_menu(),
         kb.deposit_actions(),
-        kb.amount_choices("d:b:amt:", [100, 500]),
+        kb.bkash_confirm(),
         kb.crypto_networks(),
+        kb.crypto_session(FIXED_PID, automatic=True),
+        kb.crypto_session(FIXED_PID, automatic=False),
         kb.payment_review(FIXED_PID),
+        kb.admin_payment_menu(),
+        kb.account_menu(False),
+        kb.account_menu(True),
+        kb.premium_intro(),
+        kb.premium_confirm(),
+        kb.order_actions(FIXED_PID),
+        kb.order_review(FIXED_PID),
+        kb.region_menu([("bd", "Bangladesh (bd)")]),
+        kb.insufficient_balance(),
+        kb.cancel_only("m:main"),
     ]
     for markup in markups:
         for row in markup["inline_keyboard"]:
             for button in row:
-                assert not emoji.search(button["text"]), button["text"]
+                assert emoji.match(button["text"]), button["text"]
+                assert len(button["text"]) <= 40, button["text"]
+
+
+def test_amount_buttons_stay_clean_taka_labels():
+    markup = kb.amount_choices("d:b:amt:", [100, 500])
+    labels = [button["text"] for row in markup["inline_keyboard"] for button in row]
+    assert labels[:2] == ["৳100", "৳500"]
+
+
+def test_user_api_switch_hides_linking():
+    on = [b["callback_data"] for row in kb.account_menu(False, True)["inline_keyboard"] for b in row]
+    off = [b["callback_data"] for row in kb.account_menu(False, False)["inline_keyboard"] for b in row]
+    assert "ac:key" in on
+    assert "ac:key" not in off
+
+
+def test_user_api_switch_blocks_linking(harness: Harness) -> None:
+    ctx = make_ctx(harness, features={"user_api_enabled": False})
+    assert ui.user_api_enabled(ctx) is False
+    assert asyncio.run(ui.ensure_user_key(ctx)) == ""
+    asyncio.run(handlers.account_key_action(ctx))
+    assert "turned off by the admin" in harness.last()
+    assert asyncio.run(handlers.db.get_state(USER_ID)) in (None, {})
+
+
+def test_user_api_switch_defaults_to_on(harness: Harness) -> None:
+    ctx = make_ctx(harness)
+    assert ui.user_api_enabled(ctx) is True
+    assert ui.user_api_enabled(make_ctx(harness, features={"user_api_enabled": True})) is True
+
+
+def test_admin_toggle_flips_the_user_api_switch(harness: Harness) -> None:
+    ctx = make_ctx(harness, is_admin=True)
+    asyncio.run(handlers.admin_toggle_user_api(ctx))
+    assert harness.fake.features == {"user_api_enabled": False}
+    assert ctx.features == {"user_api_enabled": False}
+    assert "now off" in harness.last()
+    assert "a:api:userkeys" in harness.all_callbacks()
+
+    asyncio.run(handlers.admin_toggle_user_api(ctx))
+    assert harness.fake.features == {"user_api_enabled": True}
+    assert "now on" in harness.last()
+
+
+def test_admin_api_menu_shows_the_switch(harness: Harness) -> None:
+    ctx = make_ctx(harness, is_admin=True)
+    asyncio.run(handlers.admin_api_menu(ctx))
+    assert "User API keys (everyone): on" in harness.last()
+    assert "a:api:userkeys" in harness.all_callbacks()
