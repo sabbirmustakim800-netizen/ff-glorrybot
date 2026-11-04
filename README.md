@@ -27,8 +27,8 @@ and credited to user balances in MongoDB.
 | `/help` | usage |
 | `/balance` | current balance |
 | `/admin` | admin control panel (**ADMIN_IDS only**) |
-| `/bkash <TrxID> <sender_number> [amount]` | e.g. `/bkash BFD90JRLST 01712345678 500` |
-| `/binance <COIN> <txId> [amount]` | e.g. `/binance USDT 98A3EA56... 10` |
+| `/bkash <TrxID> <sender_number> [amount]` | optional shortcut for the bKash form |
+| `/binance <COIN> <txId> [amount]` | optional shortcut for crypto verification |
 | `/ffbalance` | FF Glory account credits (basic/premium) |
 | `/ffregions` | regions & credit prices |
 | `/fflaunch <region> <clan_id>` | launch a glory group (1 credit) |
@@ -84,10 +84,63 @@ Glory calls themselves (account, pricing, groups, coupons, redeemed coupons,
 transactions, activity log, notifications) so admins can verify a key on the
 spot.
 
+## Deposits: guided forms, no commands
+
+Users never type a raw command to top up. Both methods are button-driven forms
+that validate every field and keep the internal state in Mongo.
+
+**bKash (interactive form).** *Deposit → bKash* shows the receiving number and a
+`Start bKash Deposit` button, then asks for three things one at a time:
+
+1. the sender number (normalised to `01XXXXXXXXX`; `+880…` is accepted),
+2. the TrxID from the confirmation SMS (8–20 letters/digits),
+3. the amount (a number or a quick-amount button; the minimum is configurable).
+
+A summary with `Confirm & Verify` follows. If a TrxID verification provider is
+configured (`BKASH_API_*`), the payment is checked live and credited
+immediately; if not, the request is stored as `needs_review`, every admin gets
+the details with `Credit Balance` / `Decline` buttons, and the user receives a
+reference number. Declining notifies the buyer; crediting is atomic and can
+only happen once per payment.
+
+**bKash number from the panel.** *Admin Panel → Payment Settings → Set bKash
+Number* stores the receiving number in the `settings` document. Users see the
+new number on the next screen — no redeploy. The same screen sets the minimum
+deposit and shows whether bKash/Binance auto-verification is on.
+
+**Crypto (per-session address).** *Deposit → Crypto* asks for a network
+(TRC20/BEP20) and an amount in BDT, then opens a deposit session:
+
+- the address comes from `GET /sapi/v1/capital/deposit/address` when Binance
+  keys are configured (falling back to the wallet saved in *API Settings*);
+- because TRC20 has no memo field, the session gets a **unique fractional
+  amount** (e.g. `10.37 USDT` instead of `10.00`), so two users' transfers to
+the same address can never be confused;
+- `I have paid - check now` reads the deposit ledger and credits the balance
+  when a matching, confirmed deposit appears. Each txId can be credited once
+  (unique index on `payments(kind, ref)`), and the session is closed on success;
+- without Binance keys the same session asks for the transaction hash and goes
+to the admin review queue instead.
+
+Sessions expire after 60 minutes and are scoped to the Telegram user who
+opened them — a callback with another user's session id is rejected.
+
+**Everything is priced in Taka.** The bKash form only accepts amounts in
+Bangladeshi Taka (৳): the receiving screen, the amount step, the summary and the
+quick-amount buttons all show ৳, and a dollar or crypto amount (`$5`, `5 USDT`)
+is refused instead of converted, so a payment can never be credited at a rate
+the user did not see. Crypto deposits stay separate: there the user still picks
+Taka but the exact coin amount is shown for the transfer.
+
+**Nothing internal reaches users.** Provider errors, HTTP statuses, payloads,
+API keys and configuration variable names are never shown in the chat. A failed
+operation returns a short reference (`ERR-1A2B3C`) that matches a full detail
+line in the server log; configuration hints are shown to admins only.
+
 **Authorization.** `ADMIN_IDS` is read from the environment only. Non-admins
-never see the admin button, and `/admin` or any `a:*` / `o:*` callback answers
-`Access denied. This command and panel are for administrators only.` Admin
-wizards re-check the sender on every text input.
+never see the admin button, and `/admin` or any `a:*` / `o:*` / `pay:*` callback
+answers `Access denied. This command and panel are for administrators only.`
+Admin wizards re-check the sender on every text input.
 
 ## ⚠️ Rotate your old credentials first
 
@@ -131,6 +184,8 @@ See [.env.example](.env.example) for the full annotated list:
   `PREMIUM_CREDIT_BDT`, `USD_BDT_RATE` — initial values only, the panel wins.
 - **Crypto wallets**: `USDT_TRC20_ADDRESS`, `USDT_BEP20_ADDRESS`,
   `SUPPORT_CONTACT`.
+- **Deposits**: `BKASH_RECEIVER_NUMBER` (initial bKash number; the admin panel
+  value wins), `MIN_DEPOSIT_BDT` (default 50).
 - **bKash provider**: `BKASH_API_BASE_URL`, `BKASH_API_KEY`,
   `BKASH_VERIFY_PATH`, request field names (`BKASH_FIELD_TRX/SENDER/AMOUNT`),
   auth header/scheme, payload mode (`json`/`form`), retry tuning,
@@ -199,7 +254,9 @@ pytest -q
 Covers: number/masked-sender matching, all four provider response envelopes,
 HTTP error mapping, timestamp parsing + freshness, Binance signature
 (encode-then-sign) and deposit status classification, config parsing, and app
-import wiring.
+import wiring — plus the guided deposits: bKash form validation, Taka-only
+amounts, admin review credit/decline, crypto sessions (dynamic address, unique
+reference amount, single credit per txId) and the secret-leak guard.
 
 ## Custom APIs — FF Glory Reseller API
 
@@ -224,10 +281,13 @@ app/
   db.py         Motor client, indexes, users/payments/orders/settings/state
   telegram.py   async sendMessage, editMessage, answerCallback, media
   keyboards.py  inline keyboards (plain-text buttons, no emoji)
+  deposits.py   deposit rules: bKash form validation, crypto session matching
   glory_api.py  FF Glory Reseller API client (master key + account key)
   ffglory.py    compatibility shim re-exporting glory_api
   bkash.py      bKash TrxID verification adapter (retries, sender & age checks)
   binance.py    signed Binance deposit lookup + status classification
+  ui.py         shared Ctx, text helpers and admin notifications
+  deposit_flows.py  guided bKash form + crypto session screens
   handlers.py   FastAPI app: webhook, menus, tiers, admin panel
 api/index.py    Vercel entrypoint
 main.py         VPS entrypoint (uvicorn)
