@@ -161,6 +161,20 @@ class Settings:
         default_factory=lambda: _env("BKASH_RECEIVER_NUMBER")
     )
     min_deposit_bdt: float = field(default_factory=lambda: _float("MIN_DEPOSIT_BDT", 50.0))
+    # --- Tokens (the only currency users see; the admin panel wins) ---
+    bot_username: str = field(default_factory=lambda: _env("BOT_USERNAME"))
+    taka_per_token: float = field(default_factory=lambda: _float("TAKA_PER_TOKEN", 1.0))
+    basic_token_cost: int = field(default_factory=lambda: _int("BASIC_TOKEN_COST", 100))
+    premium_token_cost: int = field(
+        default_factory=lambda: _int("PREMIUM_TOKEN_COST", 300)
+    )
+    referral_reward_tokens: int = field(
+        default_factory=lambda: _int("REFERRAL_REWARD_TOKENS", 20)
+    )
+    referral_goal: int = field(default_factory=lambda: _int("REFERRAL_GOAL", 5))
+    referral_coupon_tokens: int = field(
+        default_factory=lambda: _int("REFERRAL_COUPON_TOKENS", 100)
+    )
 
     @property
     def bkash_configured(self) -> bool:
@@ -277,4 +291,12 @@ def get_settings() -> Settings:
         support_contact=_env("SUPPORT_CONTACT"),
         bkash_receiver_number=_env("BKASH_RECEIVER_NUMBER"),
         min_deposit_bdt=_float("MIN_DEPOSIT_BDT", 50.0),
+        # Tokens
+        bot_username=_env("BOT_USERNAME"),
+        taka_per_token=_float("TAKA_PER_TOKEN", 1.0),
+        basic_token_cost=_int("BASIC_TOKEN_COST", 100),
+        premium_token_cost=_int("PREMIUM_TOKEN_COST", 300),
+        referral_reward_tokens=_int("REFERRAL_REWARD_TOKENS", 20),
+        referral_goal=_int("REFERRAL_GOAL", 5),
+        referral_coupon_tokens=_int("REFERRAL_COUPON_TOKENS", 100),
     )
