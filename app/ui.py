@@ -16,9 +16,11 @@ import httpx
 
 from . import db
 from . import deposits
+from . import keyboards as kb
 from .config import Pricing, Settings, get_settings, parse_rates
 from .glory_api import GloryAPI
 from .telegram import edit_message, send_message
+from .tokens import TokenConfig, fmt_tokens, token_balance
 
 logger = logging.getLogger("bot")
 
@@ -69,10 +71,17 @@ def _config_hint(ctx: "Ctx", text: str) -> str:
 
 def _help_text(is_admin: bool) -> str:
     text = (
-        "FF Glory Bot — commands\n\n"
+        "FF Glory Bot — how it works\n\n"
+        "Everything is paid in tokens. Open the keyboard at the bottom of the "
+        "chat to move around; no commands needed.\n\n"
+        "Buttons: Basic Services · Premium · Deposit · Account · Referral · "
+        "Coupons · Categories · APIs · Menu · Cancel\n\n"
         "/start — main menu\n"
-        "/balance — show your current balance\n\n"
-        "Deposits:\n"
+        "/balance — your token balance\n"
+        "/referral — your invite link and reward\n"
+        "/coupons — your token coupons\n"
+        "/redeem <CODE> — redeem a coupon\n\n"
+        "Deposits (paid in Taka, credited in tokens):\n"
         "/bkash <TrxID> <sender_number> [amount]\n"
         "  Example: /bkash BFD90JRLST 01712345678 500\n"
         "/binance <COIN> <txId> [amount]\n"
@@ -104,10 +113,33 @@ class Ctx:
     pricing: Pricing
     payment: dict = field(default_factory=dict)
     features: dict = field(default_factory=dict)
+    token_cfg: TokenConfig = field(default_factory=TokenConfig)
     is_admin: bool = False
     message_id: int | None = None
     user_api_key: str = ""
     key_loaded: bool = False
+
+
+def token_line(amount: float | int) -> str:
+    """``🪙 120`` — the only money formatting the user-facing UI uses."""
+    return fmt_tokens(amount)
+
+
+def token_amount(amount: float | int) -> str:
+    """``120`` without the symbol, for dense one-line summaries."""
+    return token_balance(amount)
+
+
+async def token_balance_of(ctx: Ctx) -> float:
+    try:
+        return await db.get_tokens(ctx.user_id)
+    except Exception:
+        logger.warning("could not read token balance", exc_info=True)
+        return 0.0
+
+
+def plan_cost(ctx: Ctx, plan_id: str = "") -> int:
+    return ctx.token_cfg.cost_for_plan(plan_id)
 
 
 def bkash_number(ctx: Ctx) -> str:
@@ -133,7 +165,9 @@ def min_deposit(ctx: Ctx) -> float:
     return value if value > 0 else deposits.MIN_DEPOSIT_BDT
 
 
-async def load_runtime(settings: Settings) -> tuple[dict, Pricing, dict, dict]:
+async def load_runtime(
+    settings: Settings,
+) -> tuple[dict, Pricing, dict, dict, TokenConfig]:
     """Merge admin panel overrides (Mongo) over environment settings."""
     doc: dict = {}
     try:
@@ -167,6 +201,7 @@ async def load_runtime(settings: Settings) -> tuple[dict, Pricing, dict, dict]:
         Pricing.from_doc(doc, settings),
         dict(doc.get("payment") or {}),
         dict(doc.get("features") or {}),
+        TokenConfig.from_doc(doc, settings),
     )
 
 
@@ -187,12 +222,12 @@ async def ensure_user_key(ctx: Ctx) -> str:
 
 def glory_client(ctx: Ctx, *, platform: bool = False) -> GloryAPI:
     """Client bound to the user's own key, or the platform key."""
-    key = ctx.api["ffglory_api_key"]
+    key = str(ctx.api.get("ffglory_api_key") or "")
     if not platform and ctx.user_api_key:
         key = ctx.user_api_key
     return GloryAPI(
-        base_url=ctx.api["ffglory_base_url"],
-        master_key=ctx.api["ffglory_master_key"],
+        base_url=str(ctx.api.get("ffglory_base_url") or "https://ffglory.pro"),
+        master_key=str(ctx.api.get("ffglory_master_key") or ""),
         api_key=key,
     )
 
@@ -219,6 +254,11 @@ async def respond(ctx: Ctx, text: str, markup: dict | None = None) -> None:
         if await edit_message(ctx.chat_id, ctx.message_id, text, markup):
             return
     await send_message(ctx.chat_id, text, markup)
+
+
+async def attach_reply_keyboard(ctx: Ctx, note: str = "Use the buttons below ⬇️") -> bool:
+    """Show the permanent bottom keyboard (Telegram keeps it until replaced)."""
+    return await send_message(ctx.chat_id, note, kb.reply_menu(ctx.is_admin))
 
 
 async def notify_admins(text: str, markup: dict | None = None) -> int:
